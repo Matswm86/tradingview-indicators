@@ -1,0 +1,229 @@
+//@version=6
+// LSD Model — Liquidity + Supply/Demand indicator
+// Source: Mangoe.co "Official Playbook" PDF + 7 YouTube breakdowns (2026).
+// Model: impulse leaves a zone -> liquidity swing forms in front (not touching) ->
+//        break of structure -> price sweeps liquidity + taps zone (wick only) ->
+//        signal on first directional close. SL = deepest wick into zone. TP 1:3 / 1:4.
+indicator("LSD Model (Liquidity + Supply/Demand)", "LSD Model", overlay = true,
+     max_boxes_count = 250, max_lines_count = 500, max_labels_count = 500)
+
+// ---------------- Inputs ----------------
+grpZone = "Zone detection"
+impulseBars   = input.int(3,   "Impulse: consecutive candles", minval = 2, maxval = 6, group = grpZone, tooltip = "Straight same-direction candles that define the 'large move' leaving the zone.")
+impulseAtrMul = input.float(1.5, "Impulse: min size (x ATR14)", minval = 0.0, step = 0.25, group = grpZone)
+accuracyZones = input.bool(false, "Accuracy zones", group = grpZone, tooltip = "Trim the far wick when the base candle out-ranges the next candle. Mangoe: works on forex, NOT recommended on XAUUSD/NAS100 5m futures.")
+maxAgeBars    = input.int(300, "Zone max age (bars)", minval = 50, group = grpZone)
+
+grpLiq = "Liquidity & structure"
+liqMinLeg   = input.int(2, "Min candles in liquidity leg", minval = 1, maxval = 5, group = grpLiq, tooltip = "Retracement candles forming the swing. Mangoe: 2+ candles, 1-candle swings are invalid.")
+liqHalfRule = input.bool(true, "Liquidity in zone-side half (50% rule)", group = grpLiq, tooltip = "Fib from zone edge to structure extreme: the liquidity swing must sit in the half nearest the zone.")
+
+grpSig = "Signals"
+useSession = input.bool(true, "Filter signals by session", group = grpSig)
+sessTrade  = input.session("0700-1500", "Session (exchange tz below)", group = grpSig)
+sessTz     = input.string("UTC", "Session timezone", group = grpSig)
+slTickOff  = input.int(0, "SL offset (ticks beyond wick)", minval = 0, group = grpSig, tooltip = "0 = SL in line with the deepest wick (5m rule). Use 1+ for the 30m '1 pip beyond' rule.")
+showTargets = input.bool(true, "Draw SL / 1:3 / 1:4 lines", group = grpSig)
+tgtBars     = input.int(40, "Target line length (bars)", minval = 5, group = grpSig)
+
+grpUi = "Display"
+colDem  = input.color(color.new(color.green, 78), "Demand zone", group = grpUi)
+colSup  = input.color(color.new(color.red, 78),   "Supply zone", group = grpUi)
+colLiq  = input.color(color.new(color.gray, 20),  "Liquidity level", group = grpUi)
+showLiq = input.bool(true, "Show liquidity levels", group = grpUi)
+
+// ---------------- Types & state ----------------
+// state: 0 = formed (waiting liquidity), 1 = liquidity set (waiting BOS),
+//        2 = armed (waiting tap), 3 = tapped (waiting directional close), 4 = signalled
+type Zone
+    int    dir        // 1 = demand, -1 = supply
+    float  top
+    float  bot
+    int    created
+    int    state
+    float  structExt  // structure extreme since creation (high for demand, low for supply)
+    float  liqLevel
+    int    liqBar
+    float  bosLevel
+    float  deepest    // deepest wick into the zone after tap
+    box    bx
+    line   liqLn
+    bool   swept      // liquidity taken out
+
+var array<Zone> zones = array.new<Zone>()
+
+atr = ta.atr(14)
+inSession = not useSession or not na(time(timeframe.period, sessTrade, sessTz))
+
+// consecutive-candle streaks
+var int bullStreak = 0
+var int bearStreak = 0
+bullStreak := close > open ? bullStreak + 1 : 0
+bearStreak := close < open ? bearStreak + 1 : 0
+
+var int lastDemBase = -1
+var int lastSupBase = -1
+
+// ---------------- Zone creation ----------------
+// Demand: base bearish candle at offset k, streak of k bullish candles after it.
+if bullStreak >= impulseBars
+    k = bullStreak
+    if k < 20 and close[k] < open[k] and (close - open[k - 1]) >= impulseAtrMul * atr
+        base = bar_index - k
+        if base != lastDemBase
+            lastDemBase := base
+            zTop = accuracyZones and high[k] > high[k - 1] ? math.max(open[k], close[k]) : high[k]
+            zBot = math.min(low[k], low[k - 1])
+            b = box.new(base, zTop, bar_index, zBot, border_color = color.new(colDem, 40), bgcolor = colDem, extend = extend.none)
+            zones.push(Zone.new(1, zTop, zBot, bar_index, 0, high, float(na), -1, float(na), float(na), b, line(na), false))
+
+// Supply: base bullish candle, streak of bearish candles after it.
+if bearStreak >= impulseBars
+    k = bearStreak
+    if k < 20 and close[k] > open[k] and (open[k - 1] - close) >= impulseAtrMul * atr
+        base = bar_index - k
+        if base != lastSupBase
+            lastSupBase := base
+            zBot = accuracyZones and low[k] < low[k - 1] ? math.min(open[k], close[k]) : low[k]
+            zTop = math.max(high[k], high[k - 1])
+            b = box.new(base, zTop, bar_index, zBot, border_color = color.new(colSup, 40), bgcolor = colSup, extend = extend.none)
+            zones.push(Zone.new(-1, zTop, zBot, bar_index, 0, low, float(na), -1, float(na), float(na), b, line(na), false))
+
+// ---------------- Liquidity pivots ----------------
+pl = ta.pivotlow(1, 1)
+ph = ta.pivothigh(1, 1)
+// length of the retracement leg ending at the pivot bar (offset 1)
+downLeg = 0
+upLeg = 0
+for j = 1 to 8
+    if close[j] < open[j]
+        downLeg += 1
+    else
+        break
+for j = 1 to 8
+    if close[j] > open[j]
+        upLeg += 1
+    else
+        break
+
+// ---------------- Signal flags (for alerts) ----------------
+demandSignal = false
+supplySignal = false
+zoneTapped = false
+liqSwept = false
+
+// ---------------- Zone lifecycle ----------------
+if zones.size() > 0
+    for i = zones.size() - 1 to 0
+        z = zones.get(i)
+        kill = false
+        if bar_index - z.created > maxAgeBars
+            kill := true
+        else if z.dir == 1
+            // ---- DEMAND ----
+            if z.state < 2
+                z.structExt := math.max(z.structExt, high)
+                if low <= z.top
+                    kill := true // touched before BOS: liquidity/opposing candle hit the zone
+                else
+                    if not na(pl) and pl > z.top and downLeg >= liqMinLeg and (not liqHalfRule or pl <= z.bot + 0.55 * (z.structExt - z.bot))
+                        z.liqLevel := pl
+                        z.liqBar := bar_index - 1
+                        z.bosLevel := z.structExt
+                        z.state := math.max(z.state, 1)
+                        if showLiq
+                            if not na(z.liqLn)
+                                z.liqLn.delete()
+                            z.liqLn := line.new(z.liqBar, z.liqLevel, bar_index, z.liqLevel, color = color.new(color.green, 0), style = line.style_dashed, width = 2)
+                    if z.state == 1 and close > z.bosLevel
+                        z.state := 2
+            else if z.state == 2 or z.state == 3
+                if low < z.bot or (close < z.top and close > z.bot)
+                    kill := true // broke through zone, or body closed inside it (edge close is fine)
+                else
+                    if not z.swept and low < z.liqLevel
+                        z.swept := true
+                        liqSwept := true
+                        label.new(bar_index, z.liqLevel, "liq ✕", yloc = yloc.price, style = label.style_none, textcolor = colLiq, size = size.small)
+                        if not na(z.liqLn)
+                            z.liqLn.set_style(line.style_solid)
+                            z.liqLn.set_x2(bar_index)
+                    if low <= z.top
+                        z.deepest := na(z.deepest) ? low : math.min(z.deepest, low)
+                        z.state := 3
+                        zoneTapped := true
+                        if not na(z.liqLn)
+                            z.liqLn.set_x2(bar_index)
+                    if z.state == 3 and close > open and close > z.top and inSession
+                        demandSignal := true
+                        z.state := 4
+                        sl = z.deepest - slTickOff * syminfo.mintick
+                        r = close - sl
+                        label.new(bar_index, low, "LSD long", yloc = yloc.belowbar, style = label.style_triangleup, color = color.green, textcolor = color.white, size = size.small)
+                        if showTargets
+                            line.new(bar_index, sl, bar_index + tgtBars, sl, color = color.red, width = 1)
+                            line.new(bar_index, close + 3 * r, bar_index + tgtBars, close + 3 * r, color = color.teal, style = line.style_dotted)
+                            line.new(bar_index, close + 4 * r, bar_index + tgtBars, close + 4 * r, color = color.teal)
+        else
+            // ---- SUPPLY ----
+            if z.state < 2
+                z.structExt := math.min(z.structExt, low)
+                if high >= z.bot
+                    kill := true
+                else
+                    if not na(ph) and ph < z.bot and upLeg >= liqMinLeg and (not liqHalfRule or ph >= z.top - 0.55 * (z.top - z.structExt))
+                        z.liqLevel := ph
+                        z.liqBar := bar_index - 1
+                        z.bosLevel := z.structExt
+                        z.state := math.max(z.state, 1)
+                        if showLiq
+                            if not na(z.liqLn)
+                                z.liqLn.delete()
+                            z.liqLn := line.new(z.liqBar, z.liqLevel, bar_index, z.liqLevel, color = color.new(color.red, 0), style = line.style_dashed, width = 2)
+                    if z.state == 1 and close < z.bosLevel
+                        z.state := 2
+            else if z.state == 2 or z.state == 3
+                if high > z.top or (close < z.top and close > z.bot)
+                    kill := true
+                else
+                    if not z.swept and high > z.liqLevel
+                        z.swept := true
+                        liqSwept := true
+                        label.new(bar_index, z.liqLevel, "liq ✕", yloc = yloc.price, style = label.style_none, textcolor = colLiq, size = size.small)
+                        if not na(z.liqLn)
+                            z.liqLn.set_style(line.style_solid)
+                            z.liqLn.set_x2(bar_index)
+                    if high >= z.bot
+                        z.deepest := na(z.deepest) ? high : math.max(z.deepest, high)
+                        z.state := 3
+                        zoneTapped := true
+                        if not na(z.liqLn)
+                            z.liqLn.set_x2(bar_index)
+                    if z.state == 3 and close < open and close < z.bot and inSession
+                        supplySignal := true
+                        z.state := 4
+                        sl = z.deepest + slTickOff * syminfo.mintick
+                        r = sl - close
+                        label.new(bar_index, high, "LSD short", yloc = yloc.abovebar, style = label.style_triangledown, color = color.red, textcolor = color.white, size = size.small)
+                        if showTargets
+                            line.new(bar_index, sl, bar_index + tgtBars, sl, color = color.red, width = 1)
+                            line.new(bar_index, close - 3 * r, bar_index + tgtBars, close - 3 * r, color = color.teal, style = line.style_dotted)
+                            line.new(bar_index, close - 4 * r, bar_index + tgtBars, close - 4 * r, color = color.teal)
+        // extend / cleanup
+        if kill
+            z.bx.delete()
+            if not na(z.liqLn)
+                z.liqLn.delete()
+            zones.remove(i)
+        else
+            z.bx.set_right(bar_index)
+            if not na(z.liqLn) and not z.swept
+                z.liqLn.set_x2(bar_index)
+            if z.state == 4 and bar_index - z.created > 0
+                z.bx.set_border_color(color.new(z.dir == 1 ? color.green : color.red, 0))
+
+// ---------------- Alerts ----------------
+alertcondition(demandSignal, "LSD long signal",  "LSD Model: demand tap + bullish close on {{ticker}} {{interval}}")
+alertcondition(supplySignal, "LSD short signal", "LSD Model: supply tap + bearish close on {{ticker}} {{interval}}")
+alertcondition(zoneTapped,   "LSD zone tapped",  "LSD Model: zone tapped on {{ticker}} {{interval}}, watch for directional close")
+alertcondition(liqSwept,     "LSD liquidity swept", "LSD Model: liquidity taken out on {{ticker}} {{interval}}")

@@ -1,6 +1,15 @@
-# LiqSweep+iFVG Indicator
+# TradingView Indicators
 
-Pine Script v6 indicator for intraday futures. Built and tested on MNQ (Micro E-mini Nasdaq-100), 1-minute timeframe.
+Pine Script v6 indicators for intraday futures, built and tested on MNQ (Micro E-mini Nasdaq-100).
+
+| Indicator | File | Idea |
+|---|---|---|
+| LiqSweep+iFVG | `LiqSweep_iFVG.pine` | Session-liquidity raid into inverted-FVG reversal |
+| LiqSweep+iFVG Pro | `LiqSweep_iFVG_Pro.pine` | Same core plus order-flow/auction confluences |
+| LiqSweep CVD | `LiqSweep_CVD.pine` | Cumulative volume delta companion pane |
+| LSD Model | `LSD_Model.pine` | Supply/demand zone + liquidity sweep + directional-close entry |
+
+## LiqSweep+iFVG
 
 ![LiqSweep+iFVG on MNQ 1m](assets/liqsweep-ifvg-mnq-1m.png)
 
@@ -28,6 +37,17 @@ Session-liquidity raid into inverted-FVG reversal.
 - **Alerts** for long, short, any entry, level swept, and value-area reclaim, so the markers can be switched off entirely.
 
 The footprint modules need a TradingView plan that includes volume-footprint data, and a symbol with real trade data rather than a CFD proxy. Where footprint data is unavailable those modules draw nothing and the rest of the indicator is unaffected.
+
+## LSD Model
+
+[`LSD_Model.pine`](LSD_Model.pine) implements the "LSD" (Liquidity + Supply/Demand) model taught publicly by Mangoe (mangoe.co playbook and YouTube): supply/demand zones with a liquidity sweep required before entry.
+
+![LSD Model on MNQ 5m](assets/lsd-model-mnq-5m.png)
+
+- **Zone**: the final opposite-direction candle before an impulsive move (N straight candles, displacement ≥ k×ATR), extended to the next candle's near wick. Optional "accuracy zone" trimming for forex (off by default; the model's author reports it works worse on futures).
+- **Liquidity**: a 2+ candle swing must form in front of the zone without touching it, in the zone-side half of the setup (fib 50% rule), then structure must break in the setup's direction.
+- **Entry signal**: price sweeps the liquidity (green/red line, "liq ✕" mark on the sweep candle), wicks into the zone without a body close inside it, and the first directional close prints the triangle. Stop line at the deepest wick into the zone, targets at 1:3 and 1:4.
+- **Session filter** (default 07:00–15:00 UTC) and four alerts: long signal, short signal, zone tapped, liquidity swept.
 
 ## Disclaimer
 
