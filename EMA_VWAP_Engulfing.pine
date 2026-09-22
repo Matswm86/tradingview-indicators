@@ -166,7 +166,7 @@ confirmOnly = input.bool(true, "Signal only on closed bars", group = grpQ, toolt
 
 // ── 04b. Day quality: is this session worth trading at all ──────────────────
 grpD = "04b · Day quality"
-gateSessVol = input.bool(true, "Skip a dead session", group = grpD, tooltip = "Every other volume test in this script compares one bar to other bars. This one compares the whole session: how much volume the day has traded by this point against how much it normally has by this point, averaged over the same number of prior days as the bar-level profile. A day running at a third of its usual pace is a day where every level is soft and every breakout is a lie, and no per-bar threshold catches that.")
+gateSessVol = input.bool(false, "Skip a dead session", group = grpD, tooltip = "Every other volume test in this script compares one bar to other bars. This one compares the whole session: how much volume the day has traded by this point against how much it normally has by this point, averaged over the same number of prior days as the bar-level profile. A day running at a third of its usual pace is a day where every level is soft and every breakout is a lie, and no per-bar threshold catches that. Off by default: the 0.70 floor has never been measured against a real dead day, so the dashboard reports the ratio either way and you can switch the gate on once you have watched it.")
 sessVolMin  = input.float(0.70, "    session volume, fraction of normal by now", minval = 0.1, maxval = 3.0, step = 0.05, group = grpD)
 gateSessRng = input.bool(true, "Skip a narrow session", group = grpD, tooltip = "The same idea on range: how far the day has travelled by this point against how far it normally has by this point. Compared against the same point of the session rather than against a whole average day, so it does not block every morning by construction.")
 sessRngMin  = input.float(0.60, "    session range, fraction of normal by now", minval = 0.1, maxval = 2.0, step = 0.05, group = grpD)
@@ -403,6 +403,12 @@ var array<float> volSlot = array.new<float>(1500, na)
 float slotRef = na
 if sessBar > 0 and dayBar > 0 and dayBar < 1500
     slotRef := array.get(volSlot, dayBar)
+// The session-volume ratio needs the profile on EVERY bar of the day, not only
+// inside a trading window, or the overnight volume lands in the numerator with
+// nothing against it. Read before this bar updates its own slot.
+float slotAll = na
+if dayBar > 0 and dayBar < 1500
+    slotAll := array.get(volSlot, dayBar)
 if barstate.isconfirmed and dayBar > 0 and dayBar < 1500 and not na(volume)
     float prevSlot = array.get(volSlot, dayBar)
     float aK = 2.0 / (volDays + 1)
@@ -427,12 +433,16 @@ if newDayRaw
 else
     dayHi := math.max(nz(dayHi, high), high)
     dayLo := math.min(nz(dayLo, low), low)
-if not na(volume)
+// Like for like: a bar adds its volume only when its slot has a reference to
+// add against it. Before 2026-09-22o the numerator took every bar from the
+// exchange-day open and the denominator only window bars, which read 5.25x at
+// 09:00 Oslo on a 1.30x day and meant the floor could never be reached.
+if not na(volume) and not na(slotAll)
     cumVolDay += volume
-if not na(slotRef)
-    cumVolRef += slotRef
+    cumVolRef += slotAll
 float sessVolRatio = cumVolRef > 0 ? cumVolDay / cumVolRef : na
-bool sessVolOk = not gateSessVol or na(sessVolRatio) or sessVolRatio >= sessVolMin
+bool sessVolLive = na(sessVolRatio) or sessVolRatio >= sessVolMin
+bool sessVolOk = not gateSessVol or sessVolLive
 
 var array<float> rngSlot = array.new<float>(1500, na)
 float rngRef = na
@@ -1058,7 +1068,7 @@ if showDash and barstate.islast
         r := r + 1
     sect(r, "THIS SESSION")
     r := r + 1
-    check(r, "Volume so far vs normal by now", na(sessVolRatio) ? "n/a" : str.tostring(sessVolRatio, "#.##") + "x", sessVolOk)
+    check(r, gateSessVol ? "Volume so far vs normal by now" : "Volume so far vs normal (gate off)", na(sessVolRatio) ? "n/a" : str.tostring(sessVolRatio, "#.##") + "x", sessVolLive)
     r := r + 1
     check(r, "Range so far vs normal by now", na(sessRngRatio) ? "n/a" : str.tostring(sessRngRatio, "#.##") + "x", sessRngOk)
     r := r + 1
