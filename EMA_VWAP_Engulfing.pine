@@ -1,0 +1,1086 @@
+//@version=6
+// MWM EMA x VWAP Engulfing
+//
+// An intraday entry-signal indicator. It reads one fast EMA against a session
+// VWAP, marks the bar where a confirmation candle turns that relationship into
+// a trade, and scores the context behind every mark, so a thin signal looks
+// thin instead of looking exactly like a strong one.
+//
+// THE MAP
+//   Price above both the EMA and VWAP is buyer control. Below both is seller
+//   control. Between the two lines is a chop zone, and by default the
+//   indicator refuses to take a long under VWAP or a short over it.
+//
+// THE FIVE SETUPS, each with its own switch
+//   A  Cross      the EMA crosses VWAP and a confirmation bar follows
+//   B  Hold       a trend pulls back into the EMA and holds it
+//   C  Snapback   price stretches far from VWAP and turns back toward it
+//   D  Retest     price pulls back into VWAP and rejects it
+//   E  Band fade  price rejects the 1-sigma VWAP band and fades to VWAP
+//   A, B and D ship on. C and E are mean-reversion trades that break the map
+//   on purpose, buying under VWAP and selling over it, so both ship off.
+//
+// THE CONFIRMATION BAR
+//   Four shapes can confirm a setup, each with its own switch: a body engulfing
+//   bar, a rejection wick at VWAP or at the EMA, a momentum bar that pulls back
+//   to the EMA and closes beyond the previous bar, and a tag of the 1-sigma
+//   band. The momentum shape exists because the other three are structurally
+//   impossible inside a one-way expansion: an engulfing bar needs an opposite
+//   coloured candle to swallow, and a rejection wick needs price to still be
+//   near VWAP. Every threshold is an input.
+//
+// A SCORE, NOT A CHAIN OF GATES
+//   Twelve context checks each pay one point: volume against the same slot of
+//   the session on earlier days, heavy volume, VWAP slope, an EMA that is
+//   still travelling, no two-sided chop, a marked level nearby, minutes held
+//   on one side of VWAP, the second EMA, the higher timeframe, the gap between
+//   the two lines, a reference market, and price on the right side of the slow
+//   third EMA. A signal fires when the total clears your threshold. Five of the
+//   twelve can be promoted from a point to a hard veto, four of them by
+//   default. The dashboard prints
+//   the live score and names whatever blocked the last setup, so a quiet chart
+//   tells you which number is too tight rather than leaving you guessing.
+//
+// EXITS
+//   Setups A, B and D exit on a candle closing through the EMA. C and E aim at
+//   VWAP, stop at the signal bar extreme and carry a time stop. The stop and
+//   target of the open trade are drawn on the chart and cleared when a new
+//   day begins.
+//
+// WHAT IT IS NOT
+//   It places no orders and it is not a strategy. Nothing in it has been
+//   backtested or walk-forward tested, and every default is a starting point
+//   rather than a measured result. Run it on a simulator, watch the dashboard
+//   for a week, then replace the numbers with your own.
+//
+// Built for futures, index and liquid equity charts on 5 minutes and up.
+// Below 5 minutes the dashboard says so in red.
+
+indicator("MWM EMA x VWAP Engulfing", "MWM EVWAPGULF", overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 50)
+
+// ── 00. Palette ─────────────────────────────────────────────────────────────
+colLong  = #26a69a
+colShort = #ef5350
+colEma   = #ffb74d
+colVwap  = #42a5f5
+colChop  = #78909c
+colExit  = #ab47bc
+colLevel = #9e9e9e
+
+// ── 01. Lines ───────────────────────────────────────────────────────────────
+grpL = "01 · Lines"
+emaLen    = input.int(9, "EMA length", minval = 2, group = grpL, tooltip = "Nine is the common choice and eight behaves almost identically. Pick one and leave it alone, because switching lengths after a losing week is how a rule becomes a habit of second-guessing.")
+emaSrc    = input.source(close, "EMA source", group = grpL)
+vwapScope = input.string("Exchange day", "VWAP anchor", options = ["Exchange day", "Trading window", "New York RTH only"], group = grpL, tooltip = "Pre-market volume is thin, so a VWAP that carries it starts the day in a place the real session never agreed on. Exchange day anchors to the instrument's own daily boundary, which on futures is the overnight open. Trading window re-anchors at each window you have switched on. New York RTH only accumulates price times volume inside the US cash session and plots nothing outside it.")
+vwapSrc   = input.source(hlc3, "VWAP source", group = grpL)
+ema2Len   = input.int(21, "Second EMA (0 = off)", minval = 0, group = grpL, tooltip = "The second line price has to lose before a trend is in trouble, and the first rung of a target ladder that runs fast EMA, slow EMA, then VWAP. Price often breaks the fast EMA and keeps respecting this one. Set it to 0 to remove it and its confluence point.")
+ema3Len   = input.int(200, "Third EMA (0 = off)", minval = 0, group = grpL, tooltip = "The slow trend line. It scores a point when price is on the correct side of it, above for a long and below for a short, and it can be promoted to a hard veto in the quality group. Unlike the other two it is not part of any setup shape, so switching it off costs one confluence point and nothing else.")
+bandMult1 = input.float(1.0, "VWAP band 1 (x sigma)", minval = 0.1, step = 0.1, group = grpL, tooltip = "A volume-weighted standard deviation around VWAP. It measures how stretched price is in VWAP's own units rather than in ATR, so it widens and narrows with the day's real dispersion instead of with a fixed lookback.")
+bandMult2 = input.float(2.0, "VWAP band 2 (x sigma)", minval = 0.1, step = 0.1, group = grpL)
+showBand1 = input.bool(true, "Draw the 1-sigma band", group = grpL, tooltip = "The area between the upper and lower band is the value area, the range the session has been comfortable trading in. This pair plus VWAP is three lines, which is the whole picture for setup E.")
+showBand2 = input.bool(false, "Draw the 2-sigma band", group = grpL, tooltip = "Off by default, because five lines crowd the chart and nothing in the signal logic reads this drawing. Switch it on if you want to see how far an excursion ran before it turned.")
+bandStyle = input.string("Directional", "Band and line colours", options = ["Directional", "Neutral", "Blue"], group = grpL, tooltip = "Directional: yellow VWAP, red upper band, green lower band, fast EMA in cyan. Red and green are the same colours as the short and long markers, so the band you fade already tells you which way the fade goes. Neutral: orange VWAP with quiet periwinkle bands, for a chart that carries other drawings. Blue: everything in one colour family.")
+atrLen    = input.int(14, "ATR length (all distance filters)", minval = 2, group = grpL)
+
+// ── 02. Engulfing definition ────────────────────────────────────────────────
+grpE = "02 · Engulfing trigger"
+engMode    = input.string("Body engulf", "Engulf test", options = ["Body engulf", "Body engulf (strict)", "Full range engulf"], group = grpE, tooltip = "Body engulf: this bar's body covers the prior body, ties allowed. Strict: must exceed on both ends, no ties. Full range: this bar's body covers the prior bar's entire high-to-low range, which is rare and roughly a third as frequent.")
+engBodyATR = input.float(0.5, "Min body size (x ATR)", minval = 0.0, step = 0.05, group = grpE, tooltip = "Rejects the tiny engulfing bar inside a four-tick range, which swallows the bar before it and means nothing. Half an ATR is a deliberately high bar: lower it to about 0.25 if your chart goes quiet for whole sessions.")
+engRatio   = input.float(1.25, "Min body vs prior body", minval = 1.0, step = 0.1, group = grpE, tooltip = "1.0 is what the word engulf already implies, so anything above it demands the bar be meaningfully bigger than the one it swallowed rather than a tick longer.")
+engClose   = input.float(0.5, "Min close strength (0-1)", minval = 0.0, maxval = 1.0, step = 0.05, group = grpE, tooltip = "Where the close sits in the bar's range. 0.55 means a bullish signal bar must close in the top 45% of its own range, so a big body with a huge rejection wick on top does not count.")
+
+grpTr = "02b · Which bars can trigger"
+trigEngulf = input.bool(true, "Engulfing bar", group = grpTr)
+trigWick   = input.bool(true, "Rejection wick at the 9 EMA or VWAP", group = grpTr, tooltip = "Candle failure: price tries to break the line, fails, and closes back on the side it came from leaving a long wick. It is a different bar from an engulfing bar and it is far more common, so switching it off will quieten the chart considerably.")
+wickFrac   = input.float(0.45, "    wick must be this much of the bar's range", minval = 0.1, maxval = 0.9, step = 0.05, group = grpTr)
+trigMom    = input.bool(true, "Momentum bar off the EMA", group = grpTr, tooltip = "The continuation trigger, and the one shape that can confirm a setup during a one-way expansion. The engulfing test needs the previous candle to be the opposite colour, which never happens in a clean trend, and the rejection-wick test needs price to reach VWAP, which a trending session leaves far behind. Without this shape the indicator watches an entire expansion with a valid setup and no way to confirm it. It is deliberately narrow: the bar has to pull back to the EMA, close strongly in its own range, and close beyond the previous bar's extreme.")
+momClose   = input.float(0.70, "    close in this fraction of the bar's range", minval = 0.5, maxval = 0.95, step = 0.05, group = grpTr, tooltip = "Stricter than the engulfing bar's close test on purpose. 0.70 means a long trigger has to close in the top 30% of its own range, so a big green bar that gave most of it back does not count.")
+momBody    = input.float(0.5, "    min body (x ATR)", minval = 0.1, step = 0.05, group = grpTr)
+momTol     = input.float(0.15, "    bar must reach the EMA within (x ATR)", minval = 0.0, step = 0.05, group = grpTr, tooltip = "Ties the trigger to a pullback. Without it the shape fires on any strong bar anywhere in the move, which is chasing rather than entering.")
+trigBand   = input.bool(false, "Pullback tag of the 1-sigma VWAP band", group = grpTr, tooltip = "A trend-aligned dip buy: in an uptrend, buy the pullback that tags the lower band and closes back above it while the fast EMA is still above VWAP. Do not confuse it with setup E, which fades the band against the trend. Ships off because it fires in the same places as setup B and mostly duplicates it.")
+
+// ── 03. Setups ──────────────────────────────────────────────────────────────
+grpS = "03 · Setups"
+useCross = input.bool(true,  "A · Cross: engulf after 9 EMA crosses VWAP", group = grpS, tooltip = "The cross is the moment momentum changes hands. On its own it is a coin flip, which is why nothing fires until a confirmation bar prints inside the window below.")
+crossWin = input.int(10, "    cross is 'fresh' for N bars", minval = 1, maxval = 50, group = grpS, tooltip = "How long after the cross an engulfing bar still counts as that cross's entry.")
+useHold  = input.bool(true,  "B · Hold: engulf off a pullback into the 9 EMA", group = grpS, tooltip = "The continuation trade: price runs, pulls back to the fast EMA, buyers step in there, and you enter on the confirmation bar rather than on the touch.")
+holdTol  = input.float(0.15, "    pullback must tag EMA within (x ATR)", minval = 0.0, step = 0.05, group = grpS)
+holdLook = input.int(8, "    pullback valid for N bars", minval = 1, maxval = 30, group = grpS)
+holdMin  = input.int(4, "    trend must be established N bars", minval = 0, maxval = 60, group = grpS, tooltip = "Bars the 9 EMA has held its side of VWAP before a pullback entry is legal.")
+useRetest = input.bool(true, "D · Retest: trigger bar off a pullback into VWAP", group = grpS, tooltip = "Price breaks a direction, comes back to VWAP, and fails to get through it. VWAP is fair price, so the rejection there is the move proving itself. A break of the EMAs that has not been retested at VWAP has proved nothing yet.")
+vwapTol   = input.float(0.25, "    pullback must reach within (x ATR) of VWAP", minval = 0.0, step = 0.05, group = grpS)
+retestLook = input.int(6, "    retest valid for N bars", minval = 1, maxval = 30, group = grpS)
+useSnap  = input.bool(false, "C · Snapback: engulf far from VWAP, target VWAP", group = grpS, tooltip = "A deliberate exception to the zone rule: price is stretched a long way from VWAP and turns back toward it. It is mean reversion against the map, which is why it ships off and why it ignores the zone gate when you switch it on.")
+snapDist = input.float(2.5, "    min distance from VWAP (x ATR)", minval = 0.5, step = 0.1, group = grpS)
+
+// ── 03b. Setup E, the band fade ─────────────────────────────────────────────
+grpF = "03b · E · Band fade"
+useBandFade = input.bool(false, "E · Fade the 1-sigma band back to VWAP", group = grpF, tooltip = "Wait for price to sit inside the bands, wait for it to test the edge, wait for the rejection, then fade it back to VWAP. It is the range-day trade, and it breaks two of this indicator's own rules to exist: it buys below VWAP and sells above it, so the zone gate cannot apply to it, and it wants exactly the two-sided wicks the chop veto was written to block. That is why it ships off. Switch it on only when the range-day row in the dashboard reads yes.")
+eWickFrac   = input.float(0.35, "    rejection wick at the band (fraction of range)", minval = 0.1, maxval = 0.9, step = 0.05, group = grpF, tooltip = "How much of the bar has to be wick for the band test to count as a rejection rather than a pause. 0.35 is a starting point, not a measured number.")
+eAllowEngulf = input.bool(true, "    an engulfing bar at the band also counts", group = grpF, tooltip = "Accepts an engulfing bar at the band as a rejection even when the wick is short, which keeps setup E consistent with the other four.")
+eRangeReq   = input.bool(true, "    require range-day evidence", group = grpF, tooltip = "The identical fade is a good trade on a range day and a poor one on a trend day, so this switch is the only thing standing between setup E and a trend day. Leave it on.")
+eTouchMin   = input.int(3, "    band touches needed, both sides", minval = 2, maxval = 20, group = grpF, tooltip = "A range day looks literal on the chart: upper band, lower band, upper band, lower band. Touches are counted as distinct events, not as bars, and at least one has to be on each side before the day qualifies.")
+eRangeLook  = input.int(60, "    lookback for those touches (bars)", minval = 10, maxval = 500, group = grpF, tooltip = "How far back to look for those touches. 60 bars is five hours on a 5-minute chart. It is a starting point, not a measured number.")
+eVetoAccept = input.bool(true, "    veto after acceptance outside a band", group = grpF, tooltip = "Price sitting outside a band rather than poking through it is not a fade setup, it is a trend day, and fading it is the most expensive mistake this setup can make.")
+eAcceptBars = input.int(3, "    closes outside that count as acceptance", minval = 1, maxval = 20, group = grpF, tooltip = "Acceptance means price settled outside rather than wicked through. Three consecutive closes beyond the same band is the definition used here, and it is a starting point rather than a measured one.")
+eAcceptLook = input.int(30, "    acceptance stays disqualifying for N bars", minval = 1, maxval = 300, group = grpF)
+eSkipOpen   = input.bool(true, "    no fade in the opening minutes of the window", group = grpF, tooltip = "In the first minutes of a session the value area has not formed, so the bands are still wide and meaningless and a fade against them has no reference. Counted per window, so each window you switch on gets its own warm-up.")
+eOpenMin    = input.int(15, "    minutes to skip", minval = 0, maxval = 120, group = grpF)
+eTwoLoss    = input.bool(true, "    mute for the session after two stop-outs", group = grpF, tooltip = "Two losing fades in a row usually means the day is trending, not ranging. After the second stop-out this setup goes quiet until the next window opens. Counted on setup E trades only.")
+eTimeMin    = input.int(60, "    time stop, minutes without reaching VWAP", minval = 0, maxval = 480, group = grpF, tooltip = "A fade that has not reached VWAP within this many minutes is not wrong, it is stuck, and the capital is doing nothing. Set it to 0 to disable the time stop.")
+eUseScore   = input.bool(false, "    also require the confluence score", group = grpF, tooltip = "Off because the score rewards a sloping VWAP and a trending fast EMA, which is the opposite of the range day this setup needs. Switching it on will make setup E fire close to never.")
+
+// ── 04. Quality gates ───────────────────────────────────────────────────────
+grpQ = "04 · Quality gates"
+qualMode   = input.string("Custom", "Signal quality preset", options = ["Strict", "Balanced", "Loose", "Custom"], group = grpQ, tooltip = "One dial instead of twenty. Strict asks for 6 of 11 confluence points, a 12-bar cooldown, a trigger bar at least 0.8 ATR tall, a 55% rejection wick, and it only accepts rejection wicks at VWAP. Loose drops all of that. Custom uses the numbers you set below and ignores the preset, and it is the default because the cooldown and the score threshold below are only read in Custom mode: on any preset your numbers there are silently overwritten.")
+cooldownMin = input.int(75, "    minutes between signals (Custom)", minval = 0, maxval = 480, group = grpQ, tooltip = "Without a cooldown, one pullback produces a cluster of near-identical entries as the state machine re-arms after each fast exit. It is counted in MINUTES, not in bars, so dropping from a 5-minute chart to a 1-minute chart no longer multiplies the signal count by five on its own. 75 minutes is the same spacing that 15 bars gave on a 5-minute chart.")
+minRangeATR = input.float(0.8, "    trigger bar must be this tall (x ATR, Custom)", minval = 0.0, step = 0.1, group = grpQ, tooltip = "Applies to every trigger shape, not only to engulfing bars, so a two-tick doji with a long wick cannot fire a signal. This is the single most effective control over how noisy the chart gets.")
+wickAtEma   = input.bool(false, "    accept rejection wicks at the 9 EMA too (Custom)", group = grpQ, tooltip = "Off means only a rejection at VWAP counts. The 9 EMA is touched many times a session, so wicks there are common and cheap.")
+vetoChop    = input.bool(true, "    two-sided chop is a hard veto, not a point (Custom)", group = grpQ)
+retestBoth  = input.bool(true, "    setup D must close beyond BOTH lines (Custom)", group = grpQ, tooltip = "On means a VWAP retest entry also has to close beyond the 9 EMA, which is the zone rule: above both lines the buyers are in control and between the two lines is a do-not-trade. Off allows the entry that closes back above VWAP while still under the fast EMA, and that is the bar that leaves marks sitting between the lines.")
+minScore   = input.int(8, "Minimum confluence score to fire", minval = 0, maxval = 12, group = grpQ, tooltip = "Each quality check is worth a point instead of being a veto. Twelve points are available: volume, heavy volume, VWAP slope, EMA not flat, no two-sided chop, at a marked level, held the side for N minutes, second EMA agrees, higher timeframe agrees, lines not too far apart, reference market agrees, price on the right side of the third EMA. The reference market only scores when you switch it on, so the realistic ceiling is 11 and a score of 9 is already the top band. Eight is the default and it grades as A. Set this to 9 to take A-plus only, which is the cleanest way to get one to three signals a session without capping the count by arrival order.")
+holdMinutes = input.int(15, "Minutes on one side of VWAP to count as 'held'", minval = 1, maxval = 120, group = grpQ, tooltip = "How long price has to stay on one side of VWAP before the side counts as held rather than as a passing poke. Fifteen to thirty minutes is the usual range.")
+vetoSlope  = input.bool(true, "Veto: VWAP must slope with the trade", group = grpQ, tooltip = "A fast EMA above the slow one while VWAP slopes the other way is a disagreement, not a trend. As a veto this blocks the trade outright instead of costing it one point.")
+vetoE2     = input.bool(true, "Veto: fast EMA must be on the right side of the second EMA", group = grpQ)
+vetoE3     = input.bool(false, "Veto: price must be on the right side of the third EMA", group = grpQ, tooltip = "On means no long below the slow EMA and no short above it, which refuses every counter-trend entry outright instead of docking it one point. Off by default because it removes most of the mean-reversion setups and a fair share of the retests.")
+vetoHtf    = input.bool(true, "Veto: higher timeframe 9/21 must agree", group = grpQ)
+htfOn      = input.bool(true, "Score the higher timeframe 9/21", group = grpQ, tooltip = "Before entering on your chart timeframe, check that the higher timeframe pair agrees, so the cross happened in the direction of the larger trend rather than against it.")
+htfTf      = input.timeframe("15", "    higher timeframe", group = grpQ)
+gateZone   = input.bool(true, "Zone rule: no longs under VWAP, no shorts over VWAP", group = grpQ, tooltip = "No longs under VWAP and no shorts over it. Setups C and E ignore this on purpose, because both are mean-reversion trades that live on the wrong side by design.")
+gateVol    = input.bool(true, "Volume must show up on the signal bar", group = grpQ)
+volMult    = input.float(1.25, "    volume x average", minval = 0.1, step = 0.1, group = grpQ)
+volLen     = input.int(20, "    fallback flat average length", minval = 2, group = grpQ)
+volDays    = input.int(10, "    days in the time-of-day volume profile", minval = 2, maxval = 60, group = grpQ, tooltip = "This bar is compared to what the same slot of the session normally trades, averaged over this many prior days, not to a flat 20-bar mean. Intraday volume is U-shaped: a flat mean calls every 09:35 bar a spike and every 12:30 bar dead.")
+gateSlope  = input.bool(true, "VWAP must be sloped, not flat", group = grpQ, tooltip = "How steep VWAP is matters as much as where it is. Steep means real volume is pushing price. Flat means the day is rotating and a directional entry is a coin flip.")
+slopeMin   = input.float(0.03, "    min |VWAP slope| over 5 bars (x ATR)", minval = 0.0, step = 0.01, group = grpQ, tooltip = "VWAP is a cumulative average, so its velocity decays through the session by construction: the same visual steepness at 15:00 produces a fraction of the 09:45 reading because the volume denominator has grown all day. A threshold near 0.10 will block most afternoons for that reason alone. 0.03 is a starting point, so watch the live reading in the dashboard before you trust it.")
+gateFlat   = input.bool(true, "Block when the 9 EMA has gone flat", group = grpQ, tooltip = "A fast EMA that has gone flat for fifteen minutes means nothing is moving and there is no trade to take. The bar count is derived from your chart timeframe.")
+flatMin    = input.float(0.25, "    EMA must travel this over 15 min (x ATR)", minval = 0.0, step = 0.05, group = grpQ)
+gateChop   = input.bool(true, "Block on two-sided wicks", group = grpQ, tooltip = "Skip reason 2: 'we see wicks in both directions, that means there is no clear direction'.")
+chopLook   = input.int(5, "    lookback bars", minval = 2, maxval = 20, group = grpQ)
+chopCount  = input.int(4, "    indecision bars that block", minval = 1, maxval = 20, group = grpQ)
+gateDist   = input.bool(true, "Block when the two lines are too far apart", group = grpQ, tooltip = "When the fast EMA and VWAP have separated a long way, the move already happened and an entry here is just late.")
+distMax    = input.float(2.0, "    max |EMA - VWAP| (x ATR)", minval = 0.2, step = 0.1, group = grpQ)
+maxPerWin  = input.int(0, "Maximum signals per window (0 = no cap)", minval = 0, maxval = 20, group = grpQ, tooltip = "A hard ceiling on how many signals a trading window may produce. It ships OFF, and that is a measured decision rather than a preference: replayed on a real expansion day, a cap of two took the first two qualifying signals and threw away the third, which was the one that ran several hundred points. A cap selects by arrival order, and nothing at 09:00 knows what 15:00 will offer. Raise the score threshold above to get fewer signals; use this only when you want a hard daily discipline limit and accept losing the day's best trade to it.")
+confirmOnly = input.bool(true, "Signal only on closed bars", group = grpQ, tooltip = "Off means the marker can appear and vanish inside a live bar. Leave it on.")
+
+// ── 04b. Day quality: is this session worth trading at all ──────────────────
+grpD = "04b · Day quality"
+gateSessVol = input.bool(true, "Skip a dead session", group = grpD, tooltip = "Every other volume test in this script compares one bar to other bars. This one compares the whole session: how much volume the day has traded by this point against how much it normally has by this point, averaged over the same number of prior days as the bar-level profile. A day running at a third of its usual pace is a day where every level is soft and every breakout is a lie, and no per-bar threshold catches that.")
+sessVolMin  = input.float(0.70, "    session volume, fraction of normal by now", minval = 0.1, maxval = 3.0, step = 0.05, group = grpD)
+gateSessRng = input.bool(true, "Skip a narrow session", group = grpD, tooltip = "The same idea on range: how far the day has travelled by this point against how far it normally has by this point. Compared against the same point of the session rather than against a whole average day, so it does not block every morning by construction.")
+sessRngMin  = input.float(0.60, "    session range, fraction of normal by now", minval = 0.1, maxval = 2.0, step = 0.05, group = grpD)
+
+// ── 05. Sessions and time windows ───────────────────────────────────────────
+grpT = "05 · Session and windows"
+tzEu      = input.string("Europe/Oslo", "European timezone (Asia and main windows)", options = ["Europe/Oslo", "Europe/Berlin", "Europe/London", "UTC"], group = grpT, tooltip = "The Asia and main windows below are written in this timezone. Europe/Oslo and Europe/Berlin are the same offset, so pick whichever reads better to you.")
+tzUs      = input.string("America/New_York", "US timezone (New York window)", options = ["America/New_York", "UTC"], group = grpT, tooltip = "The New York window is defined in its own timezone on purpose. Europe and the United States switch to summer time on different dates, so a US session written in European hours is an hour wrong for about three weeks every year.")
+useAsia   = input.bool(false, "Trade the Asia window", group = grpT)
+asiaSess  = input.session("0200-0700", "    Asia (European timezone)", group = grpT)
+useLondon = input.bool(true, "Trade the main window", group = grpT)
+lonSess   = input.session("0700-1800", "    Main window (European timezone)", group = grpT, tooltip = "The main window in your European timezone. It ships as 07:00 to 18:00, which opens an hour before Frankfurt and closes two and a half hours after the New York cash open, and it is the only window switched on by default.")
+useNY     = input.bool(false, "Also trade the New York window", group = grpT, tooltip = "Off by default because the main window above already covers the New York morning. Switching it on extends the active session to 22:00 European time, since this window is defined in its own timezone.")
+nySess    = input.session("0930-1600", "    New York (US cash session)", group = grpT)
+pmSess    = input.session("0400-0930", "Pre-New-York window, for its high and low (US)", group = grpT)
+warmBars  = input.int(3, "Warm-up bars after each window opens", minval = 0, maxval = 60, group = grpT, tooltip = "A window-anchored VWAP is one bar of thin volume at the open, so the first signal after a reset is an artefact of the reset rather than a trade. Three bars is a starting point, not a measured number.")
+gateWin   = input.bool(false, "Enforce per-setup time windows", group = grpT, tooltip = "Restricts each setup to its own hours inside the active window. Off by default, because the best-time-of-day claims behind these defaults are habits rather than measurements.")
+crossSess = input.session("1000-1330", "    A · cross window (US)", group = grpT)
+holdSess  = input.session("0930-1030", "    B · hold window (US)", group = grpT)
+snapSess  = input.session("1000-1330", "    C · snapback window (US)", group = grpT)
+
+// ── 06. Levels and reference market ─────────────────────────────────────────
+grpR = "06 · Confluence"
+showLvls  = input.bool(true, "Draw PDH / PDL / PMH / PML", group = grpR, tooltip = "The first question about any signal is where it happened. Yesterday's high and low and the pre-market high and low are the levels other traders are already watching.")
+showAsiaLvl = input.bool(true, "Draw the Asia session high and low", group = grpR, tooltip = "For a European morning start, the overnight Asia range does the same job the pre-market high and low do for a New York open.")
+lvlTol    = input.float(0.5, "Signal counts as 'at a level' within (x ATR)", minval = 0.0, step = 0.1, group = grpR)
+hideHitLvl = input.bool(true, "Drop a level once price has traded through it", group = grpR, tooltip = "A level is only a level until somebody takes it. Once a bar trades through the previous day's high, the pre-market low or an Asia extreme, that price stops being resistance or support and the line is removed from the chart. It also stops paying the level confluence point, so a taken level cannot flatter a later signal. The flags reset when the level itself does: the daily pair at the exchange day boundary, the pre-market and Asia pairs when their own windows reopen.")
+gateLvl   = input.bool(false, "Require the signal to sit at a level (hard veto)", group = grpR, tooltip = "Level confluence is the difference between a good signal and a coin flip, but demanding it removes most signals. It scores a point by default rather than blocking.")
+refOn     = input.bool(false, "Require a reference market to agree", group = grpR, tooltip = "A correlated market going the other way will run over a technically perfect entry. Point the symbol below at the index or future that leads your instrument.")
+refSym    = input.symbol("CME_MINI:ES1!", "    reference symbol", group = grpR)
+
+// ── 07. Risk display ────────────────────────────────────────────────────────
+grpX = "07 · Risk and exit"
+exitMode  = input.string("Close beyond second EMA", "Exit rule", options = ["Close beyond EMA", "Open and close beyond EMA", "Close beyond second EMA", "Stop or target only"], group = grpX, tooltip = "Close beyond EMA exits on the first candle that closes through the fast EMA, which is the tightest rule here and the reason a good trend trade gets cut in half and then re-entered twenty minutes later as a second signal. Close beyond second EMA trails the slower line instead and is the default for that reason. Open and close beyond EMA waits for a candle that both opens and closes on the far side. Stop or target only ignores the moving averages and runs the trade as a plain bracket. Wicks never count in any version, and the stop is always live regardless of which rule you pick.")
+stopMode  = input.string("Signal bar extreme", "Stop line", options = ["Signal bar extreme", "Recent swing", "9 EMA", "VWAP", "ATR"], group = grpX, tooltip = "Signal bar extreme is the tightest: it exits once the bar that triggered the entry is invalidated. Recent swing puts the stop under the last confirmed swing low for a long, or over the last swing high for a short, which is where the structure actually breaks rather than where one candle ends; it is wider and it survives the noise that takes out a signal-bar stop. VWAP is where buyers defend, so a stop just beyond it exits once that battle is lost. Setup E ignores this dropdown and always stops at the rejection wick.")
+swingLen  = input.int(5, "    swing needs this many bars each side (Recent swing)", minval = 1, maxval = 50, group = grpX, tooltip = "A swing point is only confirmed once this many bars have printed on both sides of it, so the newest usable swing is always at least this many bars old. That lag is the price of a swing that never repaints. Five bars each side is a starting point, not a measured number.")
+stopBuf   = input.float(0.15, "    buffer (x ATR)", minval = 0.0, step = 0.05, group = grpX)
+rMult     = input.float(2.0, "Target (R multiple)", minval = 0.5, step = 0.5, group = grpX, tooltip = "A yardstick drawn on the chart, not an exit the indicator takes. Setups A, B and D exit on the EMA close, so this line only tells you what the trade was worth at a fixed multiple of its own risk.")
+exitBuf   = input.float(0.10, "    close has to clear the line by (x ATR)", minval = 0.0, step = 0.05, group = grpX, tooltip = "Stops a close that sits a tick past the moving average from ending the trade.")
+minHold   = input.int(3, "    no moving-average exit for the first N bars", minval = 0, maxval = 50, group = grpX, tooltip = "Gives the entry room to breathe. The stop stays live throughout.")
+showRisk  = input.bool(true, "Draw stop and target for every signal", group = grpX, tooltip = "The stop, the target and a dotted 1R line are drawn from the signal bar and stretch with the trade until it closes, then freeze where the trade ended. Earlier trades stay on the chart, so a whole session of them reads back as a history. TradingView keeps the newest 500 lines and drops older ones.")
+riskWidth = input.int(2, "    line width", minval = 1, maxval = 4, group = grpX)
+
+// ── 08. Visuals ─────────────────────────────────────────────────────────────
+grpV = "08 · Visuals"
+showZone  = input.bool(true, "Shade the no-trade zone between the lines", group = grpV)
+showLabel = input.bool(true, "Label each signal with its setup letter", group = grpV)
+showBlocked = input.bool(true, "Grey dot on every setup a gate killed", group = grpV, tooltip = "A grey circle marks an engulfing bar that had a valid setup shape and was rejected by one of the quality gates. If the chart is full of grey dots, your gates are too tight, and the dashboard names which one.")
+showDash  = input.bool(true, "Dashboard", group = grpV)
+dashPos   = input.string("Top right", "Dashboard corner", options = ["Top right", "Middle right", "Bottom right", "Top left"], group = grpV)
+dashSize  = input.string("Small", "Dashboard text size", options = ["Tiny", "Small", "Normal"], group = grpV)
+dashDetail = input.bool(true, "Show the per-check detail rows", group = grpV, tooltip = "Off leaves the verdict, the higher-timeframe block, the open trade and the day's tally, which is what you need once the numbers are tuned. On adds a line per confluence check with an ok or no beside it, which is what you need while tuning them.")
+
+// ── 08d. Higher-timeframe trend block ───────────────────────────────────────
+grpH = "09 · Higher-timeframe trend"
+hubOn    = input.bool(true, "Show the higher-timeframe trend block", group = grpH, tooltip = "A qualified-trend read on three higher timeframes, shown in the dashboard as direction plus a strength meter. A swing point is actualised after N bars, a close through the last swing flips the direction, and volume at that break decides whether the flip is confirmed or merely suspect. It is CONTEXT and it is not wired into any signal: measured over a year of index-future data, three-timeframe alignment had no edge as an entry trigger, so it tells you which way the larger clock is running and nothing more.")
+hubTf1   = input.timeframe("15",  "    timeframe 1", group = grpH)
+hubTf2   = input.timeframe("60",  "    timeframe 2", group = grpH)
+hubTf3   = input.timeframe("240", "    timeframe 3", group = grpH)
+hubSwing = input.int(6, "    swing actualisation bars", minval = 2, maxval = 50, group = grpH)
+hubSusp  = input.float(0.6, "    weight of an unconfirmed flip", minval = 0.1, maxval = 1.0, step = 0.05, group = grpH, tooltip = "A flip on expanding volume scores a full 1.0. A flip on contracting volume is suspect and scores this instead, so the strength meter is shorter.")
+hubRange = input.float(0.15, "    premium/discount modulation", minval = 0.0, maxval = 0.5, step = 0.05, group = grpH)
+hubNoRep = input.bool(true, "    wait for the higher-timeframe bar to close", group = grpH)
+
+// ── 08b. Resolve the quality preset ─────────────────────────────────────────
+bool  isCustom    = qualMode == "Custom"
+int   minScoreUse = isCustom ? minScore : qualMode == "Strict" ? 6 : qualMode == "Balanced" ? 5 : 4
+int   coolMinUse  = isCustom ? cooldownMin : qualMode == "Strict" ? 60 : qualMode == "Balanced" ? 40 : 0
+float wickUse     = isCustom ? wickFrac : qualMode == "Strict" ? 0.55 : qualMode == "Balanced" ? 0.50 : 0.45
+float minRngUse   = isCustom ? minRangeATR : qualMode == "Strict" ? 0.8 : qualMode == "Balanced" ? 0.6 : 0.4
+bool  emaWickUse  = isCustom ? wickAtEma : qualMode != "Strict"
+bool  chopVetoUse = isCustom ? vetoChop : qualMode != "Loose"
+bool  retestBothUse = isCustom ? retestBoth : qualMode != "Loose"
+
+// ── 08c. Resolve the line palette ───────────────────────────────────────────
+// Directional paints the upper band in the short colour and the lower band in
+// the long colour, so the band you are fading already says which way the fade
+// goes. Both named palettes move the fast EMA off orange, because orange sits
+// too close to both yellow and the neutral palette's VWAP and the two lines
+// blur together at a glance.
+bool  dirStyle    = bandStyle == "Directional"
+bool  neutStyle   = bandStyle == "Neutral"
+color colVwapUse  = dirStyle ? #ffeb3b : neutStyle ? #ff9800 : colVwap
+color colEmaUse   = (dirStyle or neutStyle) ? #26c6da : colEma
+color colEma2Use  = neutStyle ? #7e57c2 : #b39ddb
+color colEma3Use  = color.new(#90a4ae, 20)
+color colBandUp   = dirStyle ? colShort : neutStyle ? #9fa8da : color.new(colVwap, 65)
+color colBandDn   = dirStyle ? colLong : neutStyle ? #9fa8da : color.new(colVwap, 65)
+color colBandFill = dirStyle ? color.new(colChop, 93) : neutStyle ? color.new(#9fa8da, 90) : color.new(colVwap, 95)
+
+// ── 09. Core series ─────────────────────────────────────────────────────────
+ema9   = ta.ema(emaSrc, emaLen)
+atrVal = ta.atr(atrLen)
+
+bool inAsia  = useAsia and not na(time(timeframe.period, asiaSess, tzEu))
+bool inLon   = useLondon and not na(time(timeframe.period, lonSess, tzEu))
+bool inNYRaw = not na(time(timeframe.period, nySess, tzUs))
+bool inNY    = useNY and inNYRaw
+bool inTrade = inAsia or inLon or inNY
+int  winId   = inNY ? 3 : inLon ? 2 : inAsia ? 1 : 0
+bool newWin  = winId != 0 and winId != winId[1]
+bool inPM    = not na(time(timeframe.period, pmSess, tzUs))
+
+var int sessBar = 0
+sessBar := inTrade ? (newWin ? 1 : sessBar + 1) : 0
+bool warmOk = not inTrade or sessBar > warmBars
+
+// Bars since the exchange's own day boundary, which on MNQ is the Globex open.
+// The time-of-day volume profile is indexed by this so it covers London too.
+var int dayBar = 0
+bool newDayRaw = nz(ta.change(time("D")), 0) != 0
+dayBar := newDayRaw ? 1 : dayBar + 1
+
+var float cumPV = 0.0
+var float cumV  = 0.0
+bool newDay    = newDayRaw
+bool vwapReset = vwapScope == "New York RTH only" ? (inNYRaw and not inNYRaw[1]) : vwapScope == "Trading window" ? newWin : newDay
+if vwapReset
+    cumPV := 0.0
+    cumV  := 0.0
+bool vwapFeed = vwapScope == "New York RTH only" ? inNYRaw : vwapScope == "Trading window" ? inTrade : true
+if vwapFeed and not na(volume) and volume > 0
+    cumPV += vwapSrc * volume
+    cumV  += volume
+float vwapVal = cumV > 0 ? cumPV / cumV : na
+bool vwapOk = not na(vwapVal) and not na(atrVal) and atrVal > 0
+
+// Volume-weighted variance around VWAP: E[p^2] - VWAP^2, clamped at zero.
+var float cumPV2 = 0.0
+if vwapReset
+    cumPV2 := 0.0
+if vwapFeed and not na(volume) and volume > 0
+    cumPV2 += vwapSrc * vwapSrc * volume
+float vwapVar = cumV > 0 ? math.max(0.0, cumPV2 / cumV - vwapVal * vwapVal) : na
+float vwapSd  = na(vwapVar) ? na : math.sqrt(vwapVar)
+bool sdOk     = not na(vwapSd) and vwapSd > 0
+float bUp1 = sdOk ? vwapVal + bandMult1 * vwapSd : na
+float bLo1 = sdOk ? vwapVal - bandMult1 * vwapSd : na
+float bUp2 = sdOk ? vwapVal + bandMult2 * vwapSd : na
+float bLo2 = sdOk ? vwapVal - bandMult2 * vwapSd : na
+float sdDist = sdOk ? (close - vwapVal) / vwapSd : 0.0
+
+float ema21 = ta.ema(emaSrc, math.max(2, ema2Len))
+bool ema2On = ema2Len > 1 and not na(ema21)
+float ema200 = ta.ema(emaSrc, math.max(2, ema3Len))
+bool ema3On = ema3Len > 1 and not na(ema200)
+
+// Confirmed swing points for the "Recent swing" stop. A pivot is only known
+// swingLen bars after it printed, which is what keeps it from repainting, so
+// the newest usable swing is always a little behind price.
+float pivHi = ta.pivothigh(high, swingLen, swingLen)
+float pivLo = ta.pivotlow(low, swingLen, swingLen)
+var float lastSwingHi = na
+var float lastSwingLo = na
+if not na(pivHi)
+    lastSwingHi := pivHi
+if not na(pivLo)
+    lastSwingLo := pivLo
+
+// ── 10. Engulfing ───────────────────────────────────────────────────────────
+float bodyAbs  = math.abs(close - open)
+float prevBody = math.abs(close[1] - open[1])
+float rng      = high - low
+float closeStr = rng > 0 ? (close - low) / rng : 0.5
+
+bool prevRed   = close[1] < open[1]
+bool prevGreen = close[1] > open[1]
+bool curGreen  = close > open
+bool curRed    = close < open
+
+bool bullBody  = engMode == "Body engulf" ? close >= open[1] and open <= close[1] : engMode == "Body engulf (strict)" ? close > open[1] and open < close[1] : close >= high[1] and open <= low[1]
+bool bearBody  = engMode == "Body engulf" ? close <= open[1] and open >= close[1] : engMode == "Body engulf (strict)" ? close < open[1] and open > close[1] : close <= low[1] and open >= high[1]
+
+bool engQual   = bodyAbs >= engBodyATR * atrVal and bodyAbs >= engRatio * prevBody
+bool bullEng   = curGreen and prevRed and bullBody and engQual and closeStr >= engClose
+bool bearEng   = curRed and prevGreen and bearBody and engQual and (1 - closeStr) >= engClose
+
+// ── 10b. The other two trigger shapes ───────────────────────────────────────
+// Candle failure: price tries to break the line, fails, and closes back on the
+// side it came from leaving a long wick. It is a different bar from an engulf
+// and a far more common one, so an indicator that only accepts engulfing bars
+// will sit silent for days at a time.
+float rngSafe = high - low
+float upWickR = rngSafe > 0 ? (high - math.max(open, close)) / rngSafe : 0.0
+float dnWickR = rngSafe > 0 ? (math.min(open, close) - low) / rngSafe : 0.0
+bool bullRejVwap = vwapOk and low < vwapVal and close > vwapVal and dnWickR >= wickUse
+bool bullRejEma  = low < ema9 and close > ema9 and dnWickR >= wickUse
+bool bearRejVwap = vwapOk and high > vwapVal and close < vwapVal and upWickR >= wickUse
+bool bearRejEma  = high > ema9 and close < ema9 and upWickR >= wickUse
+bool sizeOk  = rngSafe >= minRngUse * atrVal and not na(atrVal)
+bool bullRej = bullRejVwap or (emaWickUse and bullRejEma)
+bool bearRej = bearRejVwap or (emaWickUse and bearRejEma)
+
+// The continuation bar. An expansion prints green after green, so the engulfing
+// test can never confirm it, and price that has run away from VWAP can never
+// print the rejection wick either. This shape asks for the third thing a trend
+// entry actually looks like: a pullback that reaches the fast EMA, then a bar
+// that closes strongly and beyond the previous bar.
+bool momTagLong  = low <= ema9 + momTol * atrVal
+bool momTagShort = high >= ema9 - momTol * atrVal
+bool bullMom = close > open and bodyAbs >= momBody * atrVal and closeStr >= momClose and close > high[1] and momTagLong
+bool bearMom = close < open and bodyAbs >= momBody * atrVal and (1 - closeStr) >= momClose and close < low[1] and momTagShort
+
+bool bullBand = sdOk and low <= bLo1 and close > bLo1 and ema9 > vwapVal
+bool bearBand = sdOk and high >= bUp1 and close < bUp1 and ema9 < vwapVal
+
+bool trigLong  = sizeOk and ((trigEngulf and bullEng) or (trigWick and bullRej) or (trigMom and bullMom) or (trigBand and bullBand))
+bool trigShort = sizeOk and ((trigEngulf and bearEng) or (trigWick and bearRej) or (trigMom and bearMom) or (trigBand and bearBand))
+
+// ── 11. Zones and gates ─────────────────────────────────────────────────────
+float lineHi = vwapOk ? math.max(ema9, vwapVal) : na
+float lineLo = vwapOk ? math.min(ema9, vwapVal) : na
+bool zoneLong  = vwapOk and close > lineHi
+bool zoneShort = vwapOk and close < lineLo
+bool zoneNone  = vwapOk and not zoneLong and not zoneShort
+
+int   tfSec  = nz(timeframe.in_seconds(), 60)
+// tfMinF is the real length of one bar in minutes and it is the only thing the
+// bar counters below are allowed to use. On a 30-second chart it is 0.5, where
+// an integer minutes-per-bar would round to 1 and halve every minute-based
+// window in the script without saying so.
+float tfMinF = math.max(0.01, tfSec / 60.0)
+int   tfMin  = math.max(1, int(math.round(tfMinF)))
+int flatBars = math.max(1, int(math.round(15.0 / tfMinF)))
+
+float vwapSlope = vwapOk and not na(vwapVal[5]) ? (vwapVal - vwapVal[5]) / atrVal : 0.0
+float emaTravel = not na(ema9[flatBars]) ? math.abs(ema9 - ema9[flatBars]) / atrVal : 0.0
+float lineDist  = vwapOk ? math.abs(ema9 - vwapVal) / atrVal : 0.0
+
+// Intraday volume is U-shaped, so comparing this bar to a flat 20-bar average
+// flatters the open and the close ramp and punishes midday. This compares the
+// bar to what THIS slot in the session normally does, over an EMA of prior days.
+var array<float> volSlot = array.new<float>(1500, na)
+float slotRef = na
+if sessBar > 0 and dayBar > 0 and dayBar < 1500
+    slotRef := array.get(volSlot, dayBar)
+if barstate.isconfirmed and dayBar > 0 and dayBar < 1500 and not na(volume)
+    float prevSlot = array.get(volSlot, dayBar)
+    float aK = 2.0 / (volDays + 1)
+    array.set(volSlot, dayBar, na(prevSlot) ? volume : prevSlot * (1 - aK) + volume * aK)
+float volAvg = ta.sma(volume, volLen)
+float rvol   = not na(slotRef) and slotRef > 0 ? volume / slotRef : (volAvg > 0 ? volume / volAvg : 1.0)
+bool volOk   = not gateVol or rvol >= volMult
+
+// Day quality. The same time-of-day trick applied to the whole session instead
+// of to one bar: how much this day has traded and how far it has travelled by
+// now, against what it normally does by now. A session at a third of its usual
+// pace makes every level soft, and no per-bar threshold sees that.
+var float cumVolDay = 0.0
+var float cumVolRef = 0.0
+var float dayHi = na
+var float dayLo = na
+if newDayRaw
+    cumVolDay := 0.0
+    cumVolRef := 0.0
+    dayHi := high
+    dayLo := low
+else
+    dayHi := math.max(nz(dayHi, high), high)
+    dayLo := math.min(nz(dayLo, low), low)
+if not na(volume)
+    cumVolDay += volume
+if not na(slotRef)
+    cumVolRef += slotRef
+float sessVolRatio = cumVolRef > 0 ? cumVolDay / cumVolRef : na
+bool sessVolOk = not gateSessVol or na(sessVolRatio) or sessVolRatio >= sessVolMin
+
+var array<float> rngSlot = array.new<float>(1500, na)
+float rngRef = na
+if dayBar > 0 and dayBar < 1500
+    rngRef := array.get(rngSlot, dayBar)
+float dayRange = not na(dayHi) and not na(dayLo) ? dayHi - dayLo : na
+if barstate.isconfirmed and dayBar > 0 and dayBar < 1500 and not na(dayRange)
+    float prevR = array.get(rngSlot, dayBar)
+    float aR = 2.0 / (volDays + 1)
+    array.set(rngSlot, dayBar, na(prevR) ? dayRange : prevR * (1 - aR) + dayRange * aR)
+float sessRngRatio = not na(rngRef) and rngRef > 0 and not na(dayRange) ? dayRange / rngRef : na
+bool sessRngOk = not gateSessRng or na(sessRngRatio) or sessRngRatio >= sessRngMin
+bool dayOk = sessVolOk and sessRngOk
+
+float upWick = high - math.max(open, close)
+float dnWick = math.min(open, close) - low
+bool indecis = upWick > bodyAbs and dnWick > bodyAbs
+float chopN  = math.sum(indecis ? 1 : 0, chopLook)
+bool chopOk  = not gateChop or chopN < chopCount
+
+bool flatOk  = not gateFlat or emaTravel >= flatMin
+bool distOk  = not gateDist or lineDist <= distMax  // applied to setup A only, see baseOk
+bool slopeUpOk = not gateSlope or vwapSlope >= slopeMin
+bool slopeDnOk = not gateSlope or vwapSlope <= -slopeMin
+
+string refTick = refOn ? refSym : syminfo.tickerid
+[refClose, refEma] = request.security(refTick, timeframe.period, [close, ta.ema(close, emaLen)], barmerge.gaps_off, barmerge.lookahead_off)
+bool refUpOk = not refOn or (not na(refClose) and not na(refEma) and refClose > refEma)
+bool refDnOk = not refOn or (not na(refClose) and not na(refEma) and refClose < refEma)
+
+// ── 12. Levels ──────────────────────────────────────────────────────────────
+[pdh, pdl] = request.security(syminfo.tickerid, "D", [high[1], low[1]], barmerge.gaps_off, barmerge.lookahead_off)
+var float pmh = na
+var float pml = na
+if inPM and not inPM[1]
+    pmh := high
+    pml := low
+else if inPM
+    pmh := na(pmh) ? high : math.max(pmh, high)
+    pml := na(pml) ? low : math.min(pml, low)
+
+// The overnight Asia range is the level set a London trader actually works
+// from, the way the pre-market high and low serve the New York open.
+bool inAsiaRef = not na(time(timeframe.period, asiaSess, tzEu))
+var float asiaH = na
+var float asiaL = na
+if inAsiaRef and not inAsiaRef[1]
+    asiaH := high
+    asiaL := low
+else if inAsiaRef
+    asiaH := na(asiaH) ? high : math.max(asiaH, high)
+    asiaL := na(asiaL) ? low : math.min(asiaL, low)
+
+// A level is a level until it is taken. Once a bar trades through one, the
+// price stops being a decision point, so it leaves the chart and stops paying
+// its confluence point. Each flag resets when its own level is rebuilt: the
+// daily pair at the exchange day boundary, the pre-market and Asia pairs when
+// their windows reopen. Levels still forming are never marked as taken, since
+// price sits on a running high or low the whole time it is making it.
+var bool pdhHit = false
+var bool pdlHit = false
+var bool pmhHit = false
+var bool pmlHit = false
+var bool asiaHHit = false
+var bool asiaLHit = false
+if newDayRaw
+    pdhHit := false
+    pdlHit := false
+if inPM and not inPM[1]
+    pmhHit := false
+    pmlHit := false
+if inAsiaRef and not inAsiaRef[1]
+    asiaHHit := false
+    asiaLHit := false
+took(float lvl) =>
+    not na(lvl) and high >= lvl and low <= lvl
+if took(pdh)
+    pdhHit := true
+if took(pdl)
+    pdlHit := true
+if not inPM and took(pmh)
+    pmhHit := true
+if not inPM and took(pml)
+    pmlHit := true
+if not inAsiaRef and took(asiaH)
+    asiaHHit := true
+if not inAsiaRef and took(asiaL)
+    asiaLHit := true
+
+float pdhLive = hideHitLvl and pdhHit ? na : pdh
+float pdlLive = hideHitLvl and pdlHit ? na : pdl
+float pmhLive = hideHitLvl and pmhHit ? na : pmh
+float pmlLive = hideHitLvl and pmlHit ? na : pml
+float asiaHLive = hideHitLvl and asiaHHit ? na : asiaH
+float asiaLLive = hideHitLvl and asiaLHit ? na : asiaL
+
+nearLvl(float lvl) =>
+    not na(lvl) and not na(atrVal) and math.abs(close - lvl) <= lvlTol * atrVal
+
+bool atLevel = nearLvl(pdhLive) or nearLvl(pdlLive) or nearLvl(pmhLive) or nearLvl(pmlLive) or (showAsiaLvl and (nearLvl(asiaHLive) or nearLvl(asiaLLive)))
+bool lvlOk   = not gateLvl or atLevel
+
+// ── 12b. Setup E conditions, the band fade ──────────────────────────────────
+// The range-day trade, and the only setup here that wants a flat VWAP. It needs
+// three things the other four never ask for: evidence that the day is rotating
+// rather than trending, proof that price has not accepted a position outside
+// the bands, and a session that has been open long enough for the bands to mean
+// something. Each threshold below is a starting point, not a measured result.
+int eOpenBars = math.max(0, int(math.round(eOpenMin / tfMinF)))
+int eTimeBars = math.max(1, int(math.round(math.max(1, eTimeMin) / tfMinF)))
+
+// A range day prints literally as upper band, lower band, upper band, lower
+// band, with no directional intent. Distinct touch events are counted, not
+// bars, so one long excursion cannot pass as four rotations.
+bool eTouchUp = sdOk and high >= bUp1
+bool eTouchDn = sdOk and low <= bLo1
+bool eNewUp   = eTouchUp and not eTouchUp[1]
+bool eNewDn   = eTouchDn and not eTouchDn[1]
+int  eUpN     = int(math.sum(eNewUp ? 1 : 0, eRangeLook))
+int  eDnN     = int(math.sum(eNewDn ? 1 : 0, eRangeLook))
+bool eRangeOk = not eRangeReq or (eUpN + eDnN >= eTouchMin and eUpN >= 1 and eDnN >= 1)
+
+// Price sitting outside a band rather than wicking through it is a trend day,
+// and fading a trend day is what kills this setup.
+bool eOutUp    = sdOk and close > bUp1
+bool eOutDn    = sdOk and close < bLo1
+bool eAccept   = sdOk and (math.sum(eOutUp ? 1 : 0, eAcceptBars) >= eAcceptBars or math.sum(eOutDn ? 1 : 0, eAcceptBars) >= eAcceptBars)
+int  eAccAgo   = ta.barssince(eAccept)
+bool eAcceptOk = not eVetoAccept or na(eAccAgo) or eAccAgo > eAcceptLook
+
+bool eOpenOk = not eSkipOpen or not inTrade or sessBar > eOpenBars
+
+// Two losing fades in a row usually means the day is trending after all.
+// Counted on setup E trades only and cleared when a new window opens.
+var int eLossRun = 0
+if newWin
+    eLossRun := 0
+bool eStreakOk = not eTwoLoss or eLossRun < 2
+
+// The rejection bar: price touches the band, leaves a long wick, and closes
+// back inside, which is the other side stepping in.
+bool eRejShort = sdOk and high >= bUp1 and close < bUp1 and close > vwapVal and (upWickR >= eWickFrac or (eAllowEngulf and bearEng))
+bool eRejLong  = sdOk and low <= bLo1 and close > bLo1 and close < vwapVal and (dnWickR >= eWickFrac or (eAllowEngulf and bullEng))
+bool eCondOk   = useBandFade and eRangeOk and eAcceptOk and eOpenOk and eStreakOk
+
+// ── 13. Setup logic ─────────────────────────────────────────────────────────
+bool xUpRaw  = ta.crossover(ema9, vwapVal)
+bool xDnRaw  = ta.crossunder(ema9, vwapVal)
+bool crossUp = vwapOk and xUpRaw
+bool crossDn = vwapOk and xDnRaw
+int barsUp = ta.barssince(crossUp)
+int barsDn = ta.barssince(crossDn)
+bool freshUp = not na(barsUp) and barsUp <= crossWin and (na(barsDn) or barsUp < barsDn)
+bool freshDn = not na(barsDn) and barsDn <= crossWin and (na(barsUp) or barsDn < barsUp)
+
+bool tagLong  = vwapOk and low <= ema9 + holdTol * atrVal and close > ema9
+bool tagShort = vwapOk and high >= ema9 - holdTol * atrVal and close < ema9
+int tagLongAgo  = ta.barssince(tagLong)
+int tagShortAgo = ta.barssince(tagShort)
+int upTrendAge  = ta.barssince(vwapOk and ema9 < vwapVal)
+int dnTrendAge  = ta.barssince(vwapOk and ema9 > vwapVal)
+bool trendLong  = vwapOk and ema9 > vwapVal and close > vwapVal and (na(upTrendAge) or upTrendAge >= holdMin)
+bool trendShort = vwapOk and ema9 < vwapVal and close < vwapVal and (na(dnTrendAge) or dnTrendAge >= holdMin)
+
+bool vwapTagLong  = vwapOk and low <= vwapVal + vwapTol * atrVal and close > vwapVal
+bool vwapTagShort = vwapOk and high >= vwapVal - vwapTol * atrVal and close < vwapVal
+int vwapTagLongAgo  = ta.barssince(vwapTagLong)
+int vwapTagShortAgo = ta.barssince(vwapTagShort)
+
+bool inCrossWin = not gateWin or not na(time(timeframe.period, crossSess, tzUs))
+bool inHoldWin  = not gateWin or not na(time(timeframe.period, holdSess, tzUs))
+bool inSnapWin  = not gateWin or not na(time(timeframe.period, snapSess, tzUs))
+
+bool barOk  = not confirmOnly or barstate.isconfirmed
+var int lastSigBar = na
+var int firedN = 0
+if newWin
+    firedN := 0
+bool capOk = maxPerWin == 0 or firedN < maxPerWin
+int  coolUse = int(math.round(coolMinUse / tfMinF))
+bool coolOk = na(lastSigBar) or (bar_index - lastSigBar) >= coolUse
+bool chopVetoOk = not chopVetoUse or chopOk
+bool baseOk = vwapOk and inTrade and warmOk and barOk and bar_index > 50 and coolOk and chopVetoOk and dayOk and capOk
+// Setup E drops the chop veto on purpose. A range day is two-sided wicks by
+// construction, so the gate that protects A, B and D would delete every fade.
+bool baseE = vwapOk and sdOk and inTrade and warmOk and barOk and bar_index > 50 and coolOk and dayOk and capOk
+
+bool zoneLongOk   = not gateZone or zoneLong
+bool zoneShortOk  = not gateZone or zoneShort
+bool zoneRelaxLong  = not gateZone or close > vwapVal
+bool zoneRelaxShort = not gateZone or close < vwapVal
+// The zone rule is stated on both lines: above both, buyers are in control,
+// and between the two is a chop zone. A retest that closes back above VWAP but
+// still under the fast EMA is exactly that in-between bar, so this switch
+// decides whether it counts.
+bool zoneDLong  = retestBothUse ? zoneLongOk : zoneRelaxLong
+bool zoneDShort = retestBothUse ? zoneShortOk : zoneRelaxShort
+
+// ── 13b. Confluence score, not another AND chain ────────────────────────────
+// Independent reasons pointing at the same price are what makes a level hold,
+// and the more of them there are the harder it is to get through. Multiplying
+// eight binary gates together produces an indicator that fires once a week and
+// teaches you nothing about why. This sums them and asks for a minimum, so a
+// near-miss is visible as a 5 of 11 rather than as silence.
+int holdBars = math.max(1, int(math.round(holdMinutes / tfMinF)))
+int sideAgeLong  = ta.barssince(vwapOk and close < vwapVal)
+int sideAgeShort = ta.barssince(vwapOk and close > vwapVal)
+bool heldLong  = not na(sideAgeLong) and sideAgeLong >= holdBars
+bool heldShort = not na(sideAgeShort) and sideAgeShort >= holdBars
+
+string htfRes = htfOn ? htfTf : timeframe.period
+[htfFast, htfSlow] = request.security(syminfo.tickerid, htfRes, [ta.ema(close, emaLen), ta.ema(close, math.max(2, ema2Len))], barmerge.gaps_off, barmerge.lookahead_off)
+bool htfUpOk = not htfOn or (not na(htfFast) and not na(htfSlow) and htfFast > htfSlow)
+bool htfDnOk = not htfOn or (not na(htfFast) and not na(htfSlow) and htfFast < htfSlow)
+
+bool e2UpOk = not ema2On or ema9 > ema21
+bool e2DnOk = not ema2On or ema9 < ema21
+// The slow EMA asks a different question from the other two: not whether the
+// fast lines agree, but whether the trade is with or against the day trend.
+bool e3UpOk = not ema3On or close > ema200
+bool e3DnOk = not ema3On or close < ema200
+
+int scoreLong = (volOk ? 1 : 0) + (rvol >= volMult * 1.5 ? 1 : 0) + (slopeUpOk ? 1 : 0) + (flatOk ? 1 : 0) + (chopOk ? 1 : 0) + (atLevel ? 1 : 0) + (heldLong ? 1 : 0) + (e2UpOk and ema2On ? 1 : 0) + (htfUpOk and htfOn ? 1 : 0) + (distOk ? 1 : 0) + (refUpOk and refOn ? 1 : 0) + (e3UpOk and ema3On ? 1 : 0)
+int scoreShort = (volOk ? 1 : 0) + (rvol >= volMult * 1.5 ? 1 : 0) + (slopeDnOk ? 1 : 0) + (flatOk ? 1 : 0) + (chopOk ? 1 : 0) + (atLevel ? 1 : 0) + (heldShort ? 1 : 0) + (e2DnOk and ema2On ? 1 : 0) + (htfDnOk and htfOn ? 1 : 0) + (distOk ? 1 : 0) + (refDnOk and refOn ? 1 : 0) + (e3DnOk and ema3On ? 1 : 0)
+
+// Three checks can be promoted from a point to an absolute. A fast EMA above
+// the slow one while VWAP slopes the other way is a disagreement, not a trend,
+// and a cross whose candles close on the wrong side of VWAP is a fake. Enter
+// only when the three agree.
+bool vetoLong  = (vetoSlope and not slopeUpOk) or (vetoHtf and not htfUpOk) or (vetoE2 and not e2UpOk) or (vetoE3 and not e3UpOk)
+bool vetoShort = (vetoSlope and not slopeDnOk) or (vetoHtf and not htfDnOk) or (vetoE2 and not e2DnOk) or (vetoE3 and not e3DnOk)
+bool okLong  = scoreLong >= minScoreUse and not vetoLong and lvlOk
+bool okShort = scoreShort >= minScoreUse and not vetoShort and lvlOk
+
+bool sigA_long  = useCross and baseOk and okLong and trigLong and freshUp and zoneLongOk
+bool sigA_short = useCross and baseOk and okShort and trigShort and freshDn and zoneShortOk
+bool sigB_long  = useHold and baseOk and okLong and trigLong and trendLong and not na(tagLongAgo) and tagLongAgo <= holdLook and zoneLongOk and inHoldWin
+bool sigB_short = useHold and baseOk and okShort and trigShort and trendShort and not na(tagShortAgo) and tagShortAgo <= holdLook and zoneShortOk and inHoldWin
+bool sigD_long  = useRetest and baseOk and okLong and trigLong and close > vwapVal and not na(vwapTagLongAgo) and vwapTagLongAgo <= retestLook and zoneDLong
+bool sigD_short = useRetest and baseOk and okShort and trigShort and close < vwapVal and not na(vwapTagShortAgo) and vwapTagShortAgo <= retestLook and zoneDShort
+bool sigC_long  = useSnap and baseOk and trigLong and close < vwapVal and (vwapVal - close) >= snapDist * atrVal and close > ema9 and inSnapWin
+bool sigC_short = useSnap and baseOk and trigShort and close > vwapVal and (close - vwapVal) >= snapDist * atrVal and close < ema9 and inSnapWin
+
+// Setup E never consults zoneLongOk or zoneShortOk: the fade is a long below
+// VWAP and a short above it, which is exactly what the zone rule forbids.
+bool sigE_long  = eCondOk and baseE and eRejLong and (not eUseScore or okLong)
+bool sigE_short = eCondOk and baseE and eRejShort and (not eUseScore or okShort)
+
+bool rawLong  = (sigA_long and inCrossWin) or sigB_long or sigC_long or sigD_long or sigE_long
+bool rawShort = (sigA_short and inCrossWin) or sigB_short or sigC_short or sigD_short or sigE_short
+
+// ── 14. Exit rule and state ─────────────────────────────────────────────────
+// Which line the trade trails, and how far a close has to clear it. The tight
+// version, first close through the fast EMA, cuts a working trend trade in
+// half and then re-arms, which is how one move turns into two signals.
+float exitRef = exitMode == "Close beyond second EMA" and ema2On ? ema21 : ema9
+bool maExitLong  = exitMode == "Stop or target only" ? false : exitMode == "Open and close beyond EMA" ? (open > exitRef and close < exitRef - exitBuf * atrVal) : (close < exitRef - exitBuf * atrVal)
+bool maExitShort = exitMode == "Stop or target only" ? false : exitMode == "Open and close beyond EMA" ? (open < exitRef and close > exitRef + exitBuf * atrVal) : (close > exitRef + exitBuf * atrVal)
+
+var int    pos      = 0
+var float  entryPx  = na
+var float  stopPx   = na
+var float  tgtPx    = na
+var float  tgt1Px   = na
+var line   t1Line   = na
+var string setupTag = ""
+var int    entryBar = na
+var line   slLine   = na
+var line   tpLine   = na
+
+bool longFire  = false
+bool shortFire = false
+bool exitFire  = false
+
+// Setup E cannot use the close-through-the-9-EMA exit: a fade from the upper
+// band back to VWAP spends its whole life on the wrong side of the 9 EMA, so
+// that rule would close it on the entry bar. It exits three ways instead: the
+// target is VWAP, the stop sits a little beyond the rejection wick, and a trade
+// that has not reached VWAP inside the time stop is closed as stuck.
+bool inFadeE  = pos != 0 and setupTag == "E"
+int  heldBars = na(entryBar) ? 0 : bar_index - entryBar
+bool eTimeOut = inFadeE and eTimeMin > 0 and heldBars >= eTimeBars
+bool eTgtHit  = inFadeE and vwapOk and (pos == 1 ? high >= vwapVal : low <= vwapVal)
+// The stop is live on every setup, always. It used to be decorative on A, B and
+// D: the line was drawn and nothing ever read it, so those trades could only
+// ever end on the moving average.
+bool stopHit  = pos != 0 and not na(stopPx) and (pos == 1 ? low <= stopPx : high >= stopPx)
+bool eStopHit = inFadeE and stopHit
+bool tgtHit   = pos != 0 and not na(tgtPx) and (pos == 1 ? high >= tgtPx : low <= tgtPx)
+bool maArmed  = heldBars >= minHold
+bool exitE    = inFadeE and (eStopHit or eTgtHit or eTimeOut)
+bool exitNow  = pos == 1 ? (inFadeE ? exitE : (stopHit or (exitMode == "Stop or target only" and tgtHit) or (maArmed and maExitLong))) : pos == -1 ? (inFadeE ? exitE : (stopHit or (exitMode == "Stop or target only" and tgtHit) or (maArmed and maExitShort))) : false
+
+if pos != 0 and exitNow and barOk
+    if inFadeE
+        // A bar that prints both the stop and the target is scored as a loss.
+        eLossRun := eStopHit ? eLossRun + 1 : eTgtHit ? 0 : eLossRun
+    pos := 0
+    exitFire := true
+
+if pos == 0 and rawLong
+    pos := 1
+    longFire := true
+    setupTag := sigA_long and inCrossWin ? "A" : sigB_long ? "B" : sigD_long ? "D" : sigE_long ? "E" : "C"
+else if pos == 0 and rawShort
+    pos := -1
+    shortFire := true
+    setupTag := sigA_short and inCrossWin ? "A" : sigB_short ? "B" : sigD_short ? "D" : sigE_short ? "E" : "C"
+
+if longFire or shortFire
+    lastSigBar := bar_index
+    firedN := firedN + 1
+    entryPx := close
+    entryBar := bar_index
+    // Setup E overrides the stop dropdown and always uses the rejection wick.
+    // A swing low that sits above the signal bar's own low is not a stop, so the
+    // swing mode takes whichever of the two is further from the entry, and falls
+    // back to the bar extreme before the first pivot of the chart is confirmed.
+    float swingStop = longFire ? (na(lastSwingLo) ? low : math.min(lastSwingLo, low)) : (na(lastSwingHi) ? high : math.max(lastSwingHi, high))
+    float rawStop = setupTag == "E" ? (longFire ? low : high) : stopMode == "Signal bar extreme" ? (longFire ? low : high) : stopMode == "Recent swing" ? swingStop : stopMode == "9 EMA" ? ema9 : stopMode == "VWAP" ? vwapVal : (longFire ? close - atrVal : close + atrVal)
+    stopPx := longFire ? rawStop - stopBuf * atrVal : rawStop + stopBuf * atrVal
+    float risk = math.abs(entryPx - stopPx)
+    float rrTarget = longFire ? entryPx + rMult * risk : entryPx - rMult * risk
+    tgtPx := (setupTag == "C" or setupTag == "E") ? vwapVal : rrTarget  // C and E both aim at VWAP
+    tgt1Px := longFire ? entryPx + risk : entryPx - risk
+    if showRisk
+        // Nothing is deleted: each trade keeps its own stop and target, so a
+        // session reads back as a history rather than as one live level.
+        t1Line := line.new(bar_index, tgt1Px, bar_index + 3, tgt1Px, color = color.new(colLong, 50), width = 1, style = line.style_dotted)
+        slLine := line.new(bar_index, stopPx, bar_index + 3, stopPx, color = colShort, width = riskWidth, style = line.style_solid)
+        tpLine := line.new(bar_index, tgtPx, bar_index + 3, tgtPx, color = colLong, width = riskWidth, style = line.style_solid)
+
+// The open trade's drawing stretches with it and freezes where the trade ended,
+// so a level never runs forward into bars the trade never saw.
+if pos != 0 and barstate.isconfirmed and not na(slLine)
+    int rightX = math.max(bar_index, nz(entryBar, bar_index) + 3)
+    line.set_x2(slLine, rightX)
+    line.set_x2(tpLine, rightX)
+    line.set_x2(t1Line, rightX)
+
+// ── 14b. Why a signal did not fire ──────────────────────────────────────────
+// Every gate below is a number somebody chose, and eight of them ANDed together
+// turn a setup that fires several times a day into one signal a week. These
+// counters reset at the open and show, per gate, how many engulfing setups it
+// killed today. Read them for a week and replace these defaults with numbers
+// that came from your own chart.
+bool shapeLongA  = useCross and freshUp and inCrossWin
+bool shapeLongB  = useHold and trendLong and not na(tagLongAgo) and tagLongAgo <= holdLook and inHoldWin
+bool shapeLongC  = useSnap and close < vwapVal and (vwapVal - close) >= snapDist * atrVal and close > ema9 and inSnapWin
+bool shapeShortA = useCross and freshDn and inCrossWin
+bool shapeShortB = useHold and trendShort and not na(tagShortAgo) and tagShortAgo <= holdLook and inHoldWin
+bool shapeShortC = useSnap and close > vwapVal and (close - vwapVal) >= snapDist * atrVal and close < ema9 and inSnapWin
+bool sessOk     = vwapOk and inTrade and warmOk and barOk and bar_index > 50
+bool shapeLong  = sessOk and trigLong and (shapeLongA or shapeLongB or shapeLongC)
+bool shapeShort = sessOk and trigShort and (shapeShortA or shapeShortB or shapeShortC)
+bool firedNow   = longFire or shortFire
+
+var int shapesN  = 0
+var int blkZone  = 0
+var int blkVol   = 0
+var int blkSlope = 0
+var int blkFlat  = 0
+var int blkChop  = 0
+var int blkDist  = 0
+var int blkRef   = 0
+var int blkLvl   = 0
+var int blkPos   = 0
+var int blkScore = 0
+var int blkDay   = 0
+var int blkCap   = 0
+var string lastBlock = "-"
+if newWin
+    shapesN  := 0
+    blkZone  := 0
+    blkVol   := 0
+    blkSlope := 0
+    blkFlat  := 0
+    blkChop  := 0
+    blkDist  := 0
+    blkRef   := 0
+    blkLvl   := 0
+    blkPos   := 0
+    blkScore := 0
+    blkDay   := 0
+    blkCap   := 0
+    lastBlock := "-"
+
+bool blockedLong  = false
+bool blockedShort = false
+if shapeLong or shapeShort
+    shapesN += 1
+    string why = ""
+    bool zOk2  = shapeLong ? zoneLongOk : zoneShortOk
+    bool sOk2  = shapeLong ? slopeUpOk : slopeDnOk
+    bool rOk2  = shapeLong ? refUpOk : refDnOk
+    bool dNeed = shapeLong ? shapeLongA : shapeShortA
+    if not zOk2
+        blkZone += 1
+        why := why + "zone "
+    if not volOk
+        blkVol += 1
+        why := why + "vol "
+    if not sOk2
+        blkSlope += 1
+        why := why + "slope "
+    if not flatOk
+        blkFlat += 1
+        why := why + "flat "
+    if not chopOk
+        blkChop += 1
+        why := why + "chop "
+    if dNeed and not distOk
+        blkDist += 1
+        why := why + "gap "
+    if not rOk2
+        blkRef += 1
+        why := why + "ref "
+    if not lvlOk
+        blkLvl += 1
+        why := why + "level "
+    if pos != 0 and not firedNow
+        blkPos += 1
+        why := why + "in-trade "
+    if not dayOk
+        blkDay += 1
+        why := why + (not sessVolOk ? "dead session " : "narrow session ")
+    if not capOk
+        blkCap += 1
+        why := why + "signal cap "
+    int sc = shapeLong ? scoreLong : scoreShort
+    if sc < minScoreUse
+        blkScore += 1
+        why := why + "score " + str.tostring(sc) + "/" + str.tostring(minScoreUse) + " "
+    lastBlock := why == "" ? "none, it fired" : why
+    blockedLong  := shapeLong and not longFire
+    blockedShort := shapeShort and not shortFire
+
+// A letter for the score, so "is this an A-plus setup" has an answer on the
+// chart instead of in your head. Twelve points exist but eleven are reachable
+// with the reference market off, and the level point pays rarely, so the bands
+// sit where real signals land rather than where the arithmetic ceiling is.
+grade(int sc) =>
+    sc >= 9 ? "A+" : sc >= 8 ? "A" : sc >= 6 ? "B" : "C"
+
+// ── 15. Plots ───────────────────────────────────────────────────────────────
+plot(ema9, "EMA 9", color = colEmaUse, linewidth = 2)
+plot(vwapVal, "VWAP", color = colVwapUse, linewidth = 2, style = plot.style_linebr)
+plot(ema2On ? ema21 : na, "EMA 21", color = colEma2Use, linewidth = 2)
+plot(ema3On ? ema200 : na, "EMA 200", color = colEma3Use, linewidth = 2)
+pb1u = plot(showBand1 ? bUp1 : na, "VWAP +1sd", color = colBandUp, style = plot.style_linebr)
+pb1l = plot(showBand1 ? bLo1 : na, "VWAP -1sd", color = colBandDn, style = plot.style_linebr)
+plot(showBand2 ? bUp2 : na, "VWAP +2sd", color = color.new(colBandUp, 55), style = plot.style_linebr)
+plot(showBand2 ? bLo2 : na, "VWAP -2sd", color = color.new(colBandDn, 55), style = plot.style_linebr)
+fill(pb1u, pb1l, color = colBandFill, title = "1sd band")
+plot(showLvls ? pdhLive : na, "PDH", color = colLevel, style = plot.style_circles, linewidth = 1)
+plot(showLvls ? pdlLive : na, "PDL", color = colLevel, style = plot.style_circles, linewidth = 1)
+plot(showAsiaLvl and not inAsiaRef ? asiaHLive : na, "Asia high", color = #80cbc4, style = plot.style_circles, linewidth = 1)
+plot(showAsiaLvl and not inAsiaRef ? asiaLLive : na, "Asia low", color = #80cbc4, style = plot.style_circles, linewidth = 1)
+plot(showLvls and inNYRaw ? pmhLive : na, "PMH", color = color.new(colLevel, 40), style = plot.style_circles, linewidth = 1)
+plot(showLvls and inNYRaw ? pmlLive : na, "PML", color = color.new(colLevel, 40), style = plot.style_circles, linewidth = 1)
+
+bgcolor(showZone and zoneNone and inTrade ? color.new(colChop, 92) : na, title = "No-trade zone")
+
+plotshape(longFire, "Long entry", shape.triangleup, location.belowbar, color = colLong, size = size.small)
+plotshape(shortFire, "Short entry", shape.triangledown, location.abovebar, color = colShort, size = size.small)
+plotshape(exitFire ? close : na, "Exit", shape.xcross, location.absolute, color = colExit, size = size.tiny)
+plotshape(showBlocked and blockedLong ? low : na, "Blocked long", shape.circle, location.absolute, color = color.new(colChop, 25), size = size.tiny)
+plotshape(showBlocked and blockedShort ? high : na, "Blocked short", shape.circle, location.absolute, color = color.new(colChop, 25), size = size.tiny)
+
+if showLabel and (longFire or shortFire)
+    string txt = setupTag == "E" ? "E " + (longFire ? "long" : "short") + " fade to VWAP" : grade(longFire ? scoreLong : scoreShort) + " " + setupTag + (longFire ? " long " : " short ") + str.tostring(longFire ? scoreLong : scoreShort) + "/12" + (atLevel ? " @lvl" : "") + ((longFire ? zoneLong : zoneShort) ? "" : " [VWAP only]")
+    label.new(bar_index, longFire ? low - 1.2 * atrVal : high + 1.2 * atrVal, txt, style = longFire ? label.style_label_up : label.style_label_down, color = longFire ? colLong : colShort, textcolor = color.white, size = size.small)
+
+// ── 15b. Higher-timeframe trend, context only ───────────────────────────────
+// A qualified-trend read: a swing point is actualised after hubSwing bars, a
+// CLOSE through the last swing flips the direction, and the volume at that
+// break decides whether the flip is confirmed (full weight) or suspect
+// (hubSusp). Position inside the current swing range nudges the reading by
+// hubRange, so a trend near the top of its own range reads slightly stronger.
+// Nothing here feeds a signal. Three-timeframe alignment was measured over a
+// year of index-future data and had no edge as an entry trigger, so this block
+// says which way the larger clock is running and stops there.
+hubTrend() =>
+    float ph = ta.pivothigh(high, hubSwing, hubSwing)
+    float pl = ta.pivotlow(low, hubSwing, hubSwing)
+    var float swingHi = na
+    var float swingHiVol = na
+    var bool hiLive = false
+    var float swingLo = na
+    var float swingLoVol = na
+    var bool loLive = false
+    var int dir = 0
+    var float qual = 0.6
+    if not na(ph)
+        swingHi := ph
+        swingHiVol := volume[hubSwing]
+        hiLive := true
+    if not na(pl)
+        swingLo := pl
+        swingLoVol := volume[hubSwing]
+        loLive := true
+    if hiLive and close > swingHi
+        dir := dir < 0 ? 0 : 1
+        if dir == 1
+            qual := volume > swingHiVol ? 1.0 : hubSusp
+        hiLive := false
+    if loLive and close < swingLo
+        dir := dir > 0 ? 0 : -1
+        if dir == -1
+            qual := volume > swingLoVol ? 1.0 : hubSusp
+        loLive := false
+    float mid = not na(swingHi) and not na(swingLo) and swingHi != swingLo ? math.max(-1.0, math.min(1.0, (close - (swingHi + swingLo) / 2) / (math.abs(swingHi - swingLo) / 2))) : 0.0
+    math.max(-1.0, math.min(1.0, (dir == 0 ? 0.0 : dir * qual) + hubRange * mid))
+
+float hubRaw1 = request.security(syminfo.tickerid, hubTf1, hubTrend(), barmerge.gaps_off, barmerge.lookahead_off)
+float hubRaw2 = request.security(syminfo.tickerid, hubTf2, hubTrend(), barmerge.gaps_off, barmerge.lookahead_off)
+float hubRaw3 = request.security(syminfo.tickerid, hubTf3, hubTrend(), barmerge.gaps_off, barmerge.lookahead_off)
+float hub1 = nz(hubNoRep and barstate.isrealtime ? hubRaw1[1] : hubRaw1)
+float hub2 = nz(hubNoRep and barstate.isrealtime ? hubRaw2[1] : hubRaw2)
+float hub3 = nz(hubNoRep and barstate.isrealtime ? hubRaw3[1] : hubRaw3)
+int hubUp = (hub1 > 0.35 ? 1 : 0) + (hub2 > 0.35 ? 1 : 0) + (hub3 > 0.35 ? 1 : 0)
+int hubDn = (hub1 < -0.35 ? 1 : 0) + (hub2 < -0.35 ? 1 : 0) + (hub3 < -0.35 ? 1 : 0)
+
+tfName(string tf) =>
+    str.contains(tf, "D") or str.contains(tf, "W") or str.contains(tf, "M") or str.contains(tf, "S") ? tf : (int(math.round(str.tonumber(tf))) % 60 == 0 and int(math.round(str.tonumber(tf))) >= 60 ? str.tostring(int(math.round(str.tonumber(tf))) / 60) + "H" : tf + "m")
+hubWord(float v) =>
+    math.abs(v) < 0.18 ? "flat" : (v > 0 ? "LONG" : "SHORT") + (math.abs(v) > 0.8 ? " confirmed" : " suspect")
+hubMeter(float v) =>
+    int filled = math.max(0, math.min(8, int(math.round(math.abs(v) * 8))))
+    str.repeat("|", filled) + str.repeat(".", 8 - filled)
+hubCol(float v) =>
+    math.abs(v) < 0.18 ? colChop : v > 0 ? colLong : colShort
+
+// ── 16. Dashboard ───────────────────────────────────────────────────────────
+var table dash = table.new(dashPos == "Top right" ? position.top_right : dashPos == "Middle right" ? position.middle_right : dashPos == "Bottom right" ? position.bottom_right : position.top_left, 3, 34, border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 55))
+
+string dashTxt = dashSize == "Normal" ? size.normal : dashSize == "Tiny" ? size.tiny : size.small
+color cLabel = color.new(color.gray, 15)
+color cValue = color.new(color.white, 10)
+color cSect  = color.new(color.white, 25)
+color cSectBg = color.new(color.gray, 82)
+
+sect(int r, string k) =>
+    table.cell(dash, 0, r, k, text_size = dashTxt, text_color = cSect, text_halign = text.align_left, bgcolor = cSectBg)
+    table.cell(dash, 1, r, "", text_size = dashTxt, bgcolor = cSectBg)
+    table.cell(dash, 2, r, "", text_size = dashTxt, bgcolor = cSectBg)
+line2(int r, string k, string v, color c) =>
+    table.cell(dash, 0, r, k, text_size = dashTxt, text_color = cLabel, text_halign = text.align_left)
+    table.cell(dash, 1, r, v, text_size = dashTxt, text_color = c, text_halign = text.align_right)
+    table.cell(dash, 2, r, "", text_size = dashTxt)
+check(int r, string k, string v, bool ok) =>
+    table.cell(dash, 0, r, k, text_size = dashTxt, text_color = cLabel, text_halign = text.align_left)
+    table.cell(dash, 1, r, v, text_size = dashTxt, text_color = cValue, text_halign = text.align_right)
+    table.cell(dash, 2, r, ok ? "ok" : "no", text_size = dashTxt, text_color = ok ? colLong : colShort, text_halign = text.align_right)
+trio(int r, string k, string v, string m, color c) =>
+    table.cell(dash, 0, r, k, text_size = dashTxt, text_color = cLabel, text_halign = text.align_left)
+    table.cell(dash, 1, r, v, text_size = dashTxt, text_color = c, text_halign = text.align_right)
+    table.cell(dash, 2, r, m, text_size = dashTxt, text_color = c, text_halign = text.align_right)
+
+if showDash and barstate.islast
+    table.clear(dash, 0, 0, 2, 33)
+    int sc   = math.max(scoreLong, scoreShort)
+    bool sideLong = scoreLong >= scoreShort
+    string winTxt = winId == 3 ? "New York" : winId == 2 ? "main" : winId == 1 ? "Asia" : "closed"
+    string verdict = not vwapOk ? "WAITING FOR VWAP" : not inTrade ? "WINDOW CLOSED" : pos != 0 ? "IN TRADE " + setupTag : not sessVolOk ? "DEAD SESSION, STAND DOWN" : not sessRngOk ? "NARROW SESSION, STAND DOWN" : not capOk ? "SIGNAL CAP REACHED" : not warmOk ? "WARMING UP" : not coolOk ? "COOLDOWN" : zoneLong ? "READY, LONG SIDE" : zoneShort ? "READY, SHORT SIDE" : "BETWEEN THE LINES"
+    color verdCol = not inTrade or not vwapOk ? color.gray : pos == 1 ? colLong : pos == -1 ? colShort : not dayOk or not capOk ? colShort : not coolOk or not warmOk ? colChop : zoneLong ? colLong : zoneShort ? colShort : colChop
+    int blkMax = math.max(blkZone, math.max(blkVol, math.max(blkSlope, math.max(blkFlat, math.max(blkChop, math.max(blkDist, math.max(blkRef, math.max(blkLvl, blkScore))))))))
+    string blkName = blkMax == 0 ? "nothing yet" : blkMax == blkScore ? "score too low" : blkMax == blkVol ? "volume" : blkMax == blkSlope ? "VWAP slope" : blkMax == blkFlat ? "EMA gone flat" : blkMax == blkZone ? "wrong side of the lines" : blkMax == blkChop ? "two-sided chop" : blkMax == blkDist ? "lines too far apart" : blkMax == blkLvl ? "no level nearby" : "reference market"
+    int r = 0
+    table.cell(dash, 0, r, "MWM EVWAPGULF", text_size = dashTxt, text_color = color.new(#7df3ff, 0), text_halign = text.align_left, bgcolor = cSectBg)
+    table.cell(dash, 1, r, str.tostring(tfMin) + "m", text_size = dashTxt, text_color = tfMin < 5 ? colShort : cValue, text_halign = text.align_right, bgcolor = cSectBg)
+    table.cell(dash, 2, r, winTxt, text_size = dashTxt, text_color = inTrade ? colLong : color.gray, text_halign = text.align_right, bgcolor = cSectBg)
+    r := r + 1
+    table.cell(dash, 0, r, verdict, text_size = dashTxt, text_color = verdCol, text_halign = text.align_left)
+    table.cell(dash, 1, r, grade(sc) + " " + str.tostring(sc) + "/12", text_size = dashTxt, text_color = sc >= minScoreUse ? colLong : colChop, text_halign = text.align_right)
+    table.cell(dash, 2, r, "need " + str.tostring(minScoreUse), text_size = dashTxt, text_color = cLabel, text_halign = text.align_right)
+    r := r + 1
+    if hubOn
+        sect(r, "HIGHER TIMEFRAME TREND")
+        r := r + 1
+        trio(r, tfName(hubTf3), hubWord(hub3), hubMeter(hub3), hubCol(hub3))
+        r := r + 1
+        trio(r, tfName(hubTf2), hubWord(hub2), hubMeter(hub2), hubCol(hub2))
+        r := r + 1
+        trio(r, tfName(hubTf1), hubWord(hub1), hubMeter(hub1), hubCol(hub1))
+        r := r + 1
+        line2(r, "Agreement", hubUp == 3 ? "3 of 3 long" : hubDn == 3 ? "3 of 3 short" : str.tostring(math.max(hubUp, hubDn)) + " of 3, mixed", hubUp == 3 ? colLong : hubDn == 3 ? colShort : colChop)
+        r := r + 1
+    sect(r, "THIS SESSION")
+    r := r + 1
+    check(r, "Volume so far vs normal by now", na(sessVolRatio) ? "n/a" : str.tostring(sessVolRatio, "#.##") + "x", sessVolOk)
+    r := r + 1
+    check(r, "Range so far vs normal by now", na(sessRngRatio) ? "n/a" : str.tostring(sessRngRatio, "#.##") + "x", sessRngOk)
+    r := r + 1
+    check(r, "Signals used", str.tostring(firedN) + " of " + (maxPerWin == 0 ? "no cap" : str.tostring(maxPerWin)), capOk)
+    r := r + 1
+    sect(r, "THIS BAR")
+    r := r + 1
+    line2(r, "Side of the lines", not vwapOk ? "no VWAP" : zoneLong ? "long side" : zoneShort ? "short side" : "between, no trade", not vwapOk ? color.gray : zoneLong ? colLong : zoneShort ? colShort : colChop)
+    r := r + 1
+    line2(r, "Day trend, third EMA", not ema3On ? "off" : close > ema200 ? "above, longs favoured" : "below, shorts favoured", not ema3On ? color.gray : close > ema200 ? colLong : colShort)
+    r := r + 1
+    if dashDetail
+        check(r, "VWAP slope", str.tostring(vwapSlope, "#.##") + " ATR/5b", sideLong ? slopeUpOk : slopeDnOk)
+        r := r + 1
+        check(r, "Volume vs this time of day", str.tostring(rvol, "#.##") + "x", volOk)
+        r := r + 1
+        check(r, "EMA still travelling", str.tostring(emaTravel, "#.##") + " ATR/15m", flatOk)
+        r := r + 1
+        check(r, "Two-sided chop", str.tostring(chopN, "#") + " of " + str.tostring(chopLook), chopOk)
+        r := r + 1
+        check(r, "Gap, EMA to VWAP", str.tostring(lineDist, "#.##") + " ATR", distOk)
+        r := r + 1
+        check(r, "Second EMA agrees", ema2On ? (ema9 > ema21 ? "fast above" : "fast below") : "off", sideLong ? e2UpOk : e2DnOk)
+        r := r + 1
+        check(r, "Higher timeframe agrees", htfOn ? htfTf : "off", sideLong ? htfUpOk : htfDnOk)
+        r := r + 1
+        int lvlLive = (na(pdhLive) ? 0 : 1) + (na(pdlLive) ? 0 : 1) + (na(pmhLive) ? 0 : 1) + (na(pmlLive) ? 0 : 1) + (showAsiaLvl ? (na(asiaHLive) ? 0 : 1) + (na(asiaLLive) ? 0 : 1) : 0)
+        line2(r, "At a level, levels still live", (atLevel ? "yes" : "no") + ", " + str.tostring(lvlLive) + " left", atLevel ? colLong : color.gray)
+        r := r + 1
+        line2(r, "Distance from VWAP", sdOk ? str.tostring(sdDist, "#.##") + " sd" : "n/a", math.abs(sdDist) > bandMult2 ? colShort : cValue)
+        r := r + 1
+    sect(r, "TRADE")
+    r := r + 1
+    line2(r, "State", pos == 0 ? "flat" : (pos == 1 ? "LONG " : "SHORT ") + setupTag + " (" + str.tostring(bar_index - entryBar) + " bars)", pos == 0 ? color.gray : pos == 1 ? colLong : colShort)
+    r := r + 1
+    line2(r, "Stop / target", pos == 0 ? "-" : str.tostring(stopPx, format.mintick) + " / " + str.tostring(tgtPx, format.mintick), cValue)
+    r := r + 1
+    sect(r, "TODAY")
+    r := r + 1
+    line2(r, "Setups seen / fired", str.tostring(shapesN) + " / " + str.tostring(firedN), shapesN > 0 ? cValue : color.gray)
+    r := r + 1
+    line2(r, "Biggest blocker", blkName + (blkMax > 0 ? " (" + str.tostring(blkMax) + ")" : ""), blkMax > 0 ? colShort : color.gray)
+    r := r + 1
+    line2(r, "Last setup", lastBlock, lastBlock == "none, it fired" ? colLong : colShort)
+    r := r + 1
+    if useBandFade
+        line2(r, "Band fade, range day", not eRangeOk ? "no, too few band touches" : not eAcceptOk ? "no, price accepted outside" : not eOpenOk ? "no, opening minutes" : not eStreakOk ? "no, two stop-outs" : "yes", (eRangeOk and eAcceptOk and eOpenOk and eStreakOk) ? colLong : colChop)
+        r := r + 1
+        line2(r, "Band fade, stop-out streak", str.tostring(eLossRun) + " of 2", eLossRun >= 2 ? colShort : color.gray)
+        r := r + 1
+
+alertcondition(longFire, "MWM EVWAPGULF long", "Long: bullish engulfing with 9 EMA and VWAP aligned")
+alertcondition(shortFire, "MWM EVWAPGULF short", "Short: bearish engulfing with 9 EMA and VWAP aligned")
+alertcondition(exitFire, "MWM EVWAPGULF exit", "Exit: candle closed through the 9 EMA")
+
+if longFire
+    alert(syminfo.ticker + " " + timeframe.period + " LONG " + setupTag + " @ " + str.tostring(close, format.mintick) + " stop " + str.tostring(stopPx, format.mintick) + " target " + str.tostring(tgtPx, format.mintick), alert.freq_once_per_bar_close)
+if shortFire
+    alert(syminfo.ticker + " " + timeframe.period + " SHORT " + setupTag + " @ " + str.tostring(close, format.mintick) + " stop " + str.tostring(stopPx, format.mintick) + " target " + str.tostring(tgtPx, format.mintick), alert.freq_once_per_bar_close)
+if exitFire
+    alert(syminfo.ticker + " " + timeframe.period + " EXIT @ " + str.tostring(close, format.mintick) + " - closed through the 9 EMA", alert.freq_once_per_bar_close)

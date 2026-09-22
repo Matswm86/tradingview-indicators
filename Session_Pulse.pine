@@ -1,0 +1,132 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  SESSION PULSE  ·  Pine v6  ·  pane oscillator
+//
+//  Two questions LiqSweep entries keep asking, answered in one pane:
+//
+//  1. PARTICIPATION (the ribbon): relative volume against the SAME CLOCK MINUTE
+//     averaged over the last N sessions. A sweep on 2x its usual minute-volume
+//     is live; the same sweep at 0.4x is a dead-hour drift. The ribbon breathes
+//     around the 1.0x axis: above = hot (cyan→white), below = dead (fades to
+//     grey). Thickness and glow both carry the magnitude.
+//
+//  2. ROOM LEFT (the floor strip): percent of a typical day's range already
+//     spent, computed from RUNNING session extremes only (no look-ahead) vs an
+//     average of the last 20 completed session ranges. Teal = room to travel,
+//     red = the tank is empty and a fresh reversal has little to reach for.
+//
+//  No predictive claim is attached to either metric; nothing here is
+//  backtested.
+//  Designed for intraday charts (1m-60m). Same design tokens as Trend Hub.
+// ─────────────────────────────────────────────────────────────────────────────
+
+//@version=6
+indicator("Session Pulse", "PULSE", overlay = false, max_labels_count = 4)
+
+// ── inputs ───────────────────────────────────────────────────────────────────
+gRv = "Participation (relative volume)"
+rvDays  = input.int(20, "Sessions to average per clock-minute", minval = 2, maxval = 60, group = gRv)
+hotLvl  = input.float(1.5, "Hot threshold (x usual)",  minval = 1.0, step = 0.1, group = gRv)
+deadLvl = input.float(0.5, "Dead threshold (x usual)", minval = 0.1, maxval = 1.0, step = 0.1, group = gRv)
+
+gRg = "Room left (range spent)"
+rgDays = input.int(20, "Sessions to average the day range", minval = 2, maxval = 60, group = gRg)
+fullLvl = input.float(100, "Range fully spent at (%)", minval = 50, maxval = 200, group = gRg)
+
+gVis = "Look"
+colHot  = input.color(#7DF3FF, "Hot",  group = gVis)
+colRoom = input.color(#00E5C3, "Room", group = gVis)
+colSpnt = input.color(#FF4D6D, "Spent", group = gVis)
+showHud = input.bool(true, "Pane readout", group = gVis)
+
+// shared design tokens (keep identical to Trend_Hub.pine)
+cBg   = color.new(#070B12, 8)
+cGrid = color.new(#101827, 0)
+cMute = #5A6B7E
+cText = #C9D6E3
+
+// ── 1 · relative volume vs the same clock minute ─────────────────────────────
+// one slot per minute-of-day (exchange time); EMA over the last rvDays sessions
+var array<float> minuteAvg = array.new<float>(1440, na)
+slot = hour(time, syminfo.timezone) * 60 + minute(time, syminfo.timezone)
+
+prior = array.get(minuteAvg, slot)                       // read BEFORE update: today never averages itself
+rvol  = not na(prior) and prior > 0 ? volume / prior : na
+array.set(minuteAvg, slot, na(prior) ? volume : prior + (volume - prior) / rvDays)
+
+// warm-up: count sessions seen; stay muted until the map has real history
+var int daysSeen = 0
+newDay = ta.change(time("D")) != 0
+if newDay
+    daysSeen += 1
+ready = daysSeen >= math.min(rvDays, 5)
+
+// ribbon value: log2 of the ratio, so 2x and 0.5x sit symmetric around 0
+r = ready and not na(rvol) ? math.max(-2.0, math.min(2.0, math.log(rvol) / math.log(2))) : 0.0
+rS = ta.ema(r, 3)
+
+// ── 2 · percent of a typical session range already spent ─────────────────────
+var float dayHi = na
+var float dayLo = na
+var float rangeAvg = na
+if newDay
+    if not na(dayHi) and not na(dayLo)
+        float doneRange = dayHi - dayLo
+        rangeAvg := na(rangeAvg) ? doneRange : rangeAvg + (doneRange - rangeAvg) / rgDays
+    dayHi := high
+    dayLo := low
+else
+    dayHi := math.max(nz(dayHi, high), high)
+    dayLo := math.min(nz(dayLo, low), low)
+
+spent = not na(rangeAvg) and rangeAvg > 0 ? 100 * (dayHi - dayLo) / rangeAvg : na
+spentC = math.min(150.0, nz(spent, 0))
+
+// ── colour ───────────────────────────────────────────────────────────────────
+// ribbon: dead grey → muted → hot cyan → near-white overdrive
+rvCol(x) =>
+    x >= 0 ? color.from_gradient(x, 0.0, 2.0, color.new(colHot, 55), color.new(#EAFBFF, 0)) :
+             color.from_gradient(-x, 0.0, 2.0, color.new(cMute, 45), color.new(#39444F, 10))
+
+roomCol(p) => color.from_gradient(p, 30.0, fullLvl, colRoom, colSpnt)
+
+// ── geometry: ribbon around the 1.0x axis, heat strip on the floor ───────────
+thk = 0.10 + 0.45 * math.abs(rS)
+pT = plot(rS + thk, "Pulse top",    color = color.new(rvCol(rS), 35), linewidth = 1)
+pB = plot(rS - thk, "Pulse bottom", color = color.new(rvCol(rS), 35), linewidth = 1)
+fill(pT, pB, color = rvCol(rS), title = "Participation ribbon")
+pC = plot(rS, "Pulse core", color = rvCol(rS), linewidth = 2)
+
+hline(0, "1.0x usual volume", color = color.new(#101827, 40))
+// 0.585 = log2(1.5): hline needs a constant, so the 1.5x guide is fixed even if hotLvl input changes
+hline(0.585, "Hot line (1.5x)", color = color.new(#7DF3FF, 78), linestyle = hline.style_dotted)
+hline(-1, "0.5x dead line", color = color.new(#5A6B7E, 78), linestyle = hline.style_dotted)
+
+// floor heat strip: fixed lane at the bottom, colour = room left
+sT = plot(-2.45, "Range strip top",    color = na, editable = false)
+sB = plot(-2.85, "Range strip bottom", color = na, editable = false)
+fill(sT, sB, color = na(spent) ? color.new(cMute, 80) : color.new(roomCol(spentC), 25), title = "Range-spent strip")
+
+// scale pins keep the pane steady
+plot( 2.7, "Scale pin +", color = color.new(color.gray, 100), editable = false)
+plot(-3.0, "Scale pin -", color = color.new(color.gray, 100), editable = false)
+
+// ── pane readout (glass style, matches Trend Hub) ────────────────────────────
+var table hud = table.new(position.top_right, 2, 3, bgcolor = cBg, frame_color = cGrid, frame_width = 2, border_color = color.new(#101827, 60), border_width = 1)
+
+if showHud and barstate.islast
+    rvTxt = not ready or na(rvol) ? "warming up" : str.tostring(rvol, "#.##") + "x usual" + (rvol >= hotLvl ? " · LIVE" : rvol <= deadLvl ? " · DEAD" : "")
+    rvCol_ = not ready or na(rvol) ? cMute : rvol >= hotLvl ? colHot : rvol <= deadLvl ? cMute : cText
+    spTxt = na(spent) ? "warming up" : str.tostring(math.round(spent)) + "% of a normal day" + (spent >= fullLvl ? " · SPENT" : spent <= 40 ? " · ROOM" : "")
+    spCol_ = na(spent) ? cMute : roomCol(spentC)
+    table.cell(hud, 0, 0, "⬡ SESSION PULSE", text_color = #7DF3FF, text_size = size.small, text_halign = text.align_left)
+    table.merge_cells(hud, 0, 0, 1, 0)
+    table.cell(hud, 0, 1, "VOLUME", text_color = cMute, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(hud, 1, 1, rvTxt, text_color = rvCol_, text_size = size.small, text_halign = text.align_right)
+    table.cell(hud, 0, 2, "RANGE",  text_color = cMute, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(hud, 1, 2, spTxt, text_color = spCol_, text_size = size.small, text_halign = text.align_right)
+
+// ── alerts ───────────────────────────────────────────────────────────────────
+goneHot  = ready and not na(rvol) and rvol >= hotLvl and nz(rvol[1], 1.0) < hotLvl
+allSpent = not na(spent) and spent >= fullLvl and nz(spent[1], 0) < fullLvl
+alertcondition(goneHot,  "Pulse · volume went live", "Relative volume crossed the hot threshold")
+alertcondition(allSpent, "Pulse · range spent",      "Session has used a full normal day's range")

@@ -1,5 +1,11 @@
 //@version=6
-indicator("LiqSweep+iFVG Pro", "LiqSweep+iFVG Pro", true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+indicator("LiqSweep+iFVG Pro +VWAP/Fib", "LiqSweep+iFVG Pro+VF", true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// PRIVATE BUILD - do not publish. Groups 14 (VWAP) and 15 (Sphinx fib)
+// are research add-ons on top of the public LiqSweep+iFVG Pro. Group 15
+// ports a third party's model (SphinxTrading's Fibrillator, via the
+// community strategy port shared in that Discord), so this file stays in
+// mwm-trading and out of the public tradingview-indicators repo.
 
 // ===================================================================
 // LiqSweep+iFVG Pro - session-liquidity sweep into inverted-FVG
@@ -61,6 +67,10 @@ indicator("LiqSweep+iFVG Pro", "LiqSweep+iFVG Pro", true, max_lines_count=500, m
 // - Pool tiers: equal highs/lows now arm by default and sweep
 //   markers carry his tier letter (S/A equal, B relative equal and
 //   session). Source: his printed tier list, IkTXIUDag4w 30:40.
+//
+// Group 16 draws the trade each signal implies: entry at the next
+// bar's open, stop behind the swing the sweep ran, target at 1R by
+// default, the way the VLS indicator draws them. Display only.
 //
 // Alerts exist for long, short, any entry, level swept and
 // value-area reclaim, so the markers can be switched off entirely.
@@ -205,6 +215,43 @@ colAS = input.color(#BA68C8, "Asia", inline="c", group=grpC)
 colBull = input.color(#26A69A, "Bull FVG", inline="c2", group=grpC, tooltip="Fill colors for live gap boxes and the inverted-gap highlight.")
 colBear = input.color(#EF5350, "Bear FVG", inline="c2", group=grpC)
 
+grpVW = "14. VWAP"
+vwapOn = input.bool(true, "Show VWAP", group=grpVW, tooltip="Volume-weighted average price from the chosen anchor, with optional standard-deviation bands. Auction context for judging a signal's location - a sweep-reversal long far above VWAP is chasing; one into VWAP from below is entering at value.\n\nDisplay and export only: VWAP never gates or arms a signal. ON by default so the value area is always on the chart; every VWAP-as-filter idea still goes through the engine test bench first, same as the killed delta-divergence filter.")
+vwapAnchor = input.string("Day", "Anchor / reset", options=["Day", "Week", "NY session", "London session", "Asia session"], group=grpVW, tooltip="Where the running average restarts. Day is the classic session VWAP. The session choices reset at that session's open (windows from group 01) and keep accumulating until the next open, so the level stays on screen between sessions.")
+vwapBand1 = input.bool(true,  "Band 1", inline="vb1", group=grpVW)
+vwapMult1 = input.float(1.0,  "x stdev", minval=0.1, step=0.5, inline="vb1", group=grpVW)
+vwapBand2 = input.bool(true,  "Band 2", inline="vb2", group=grpVW)
+vwapMult2 = input.float(2.0,  "x stdev", minval=0.1, step=0.5, inline="vb2", group=grpVW)
+colVwap   = input.color(#FFD54F, "VWAP", inline="vwc", group=grpVW)
+colVwBand = input.color(#90A4AE, "Bands", inline="vwc", group=grpVW)
+
+grpX = "15. Sphinx fib overlay"
+fibOn = input.bool(false, "Show Sphinx fib retracement", group=grpX, tooltip="Port of the Sphinx Fibrillator swing-fib lifecycle (SphinxTrading's model, from the community strategy port): track a swing leg, and when price pulls back to the 0.297 retracement the fib FREEZES with the full level set - 0.7 firm stop, 0.559 / 0.45 / 0.297 entries, TP1 at 0.05, TP2 at the -0.297 extension.\n\nDisplay and export only: the fib never gates, arms or fires the LiqSweep signal. OFF by default.")
+fibSource = input.string("Pro sweeps", "Swing source", options=["Pro sweeps", "ZigZag legs"], group=grpX, tooltip="Pro sweeps: a fib leg starts where THIS indicator arms a sweep-reversal - the swept extreme is the anchor and the reversal leg is tracked, so the fib prices the pullback entry into the same reversal the iFVG trigger trades. This is the actual integration.\n\nZigZag legs: faithful Sphinx mode - the last completed ZigZag leg in the direction of the EMA trend, independent of sweeps.")
+fibZzPrd   = input.int(4,    "ZigZag period", minval=2, maxval=50, group=grpX, tooltip="Pivot strength for ZigZag-legs mode. Sphinx default 4.")
+fibMinSwing = input.float(35.0, "Min swing range (points)", minval=1.0, group=grpX, tooltip="The fib will not draw or freeze until the tracked leg spans at least this many points. Sphinx defaults: 35 Normal / 37 Sphinx.")
+fibEmaLen  = input.int(56,   "Trend EMA length", minval=2, group=grpX, tooltip="Sphinx's trend filter: longs only while close is above this EMA, shorts only below. Applies to both swing sources.")
+fibSettledBars = input.int(2, "Settled bars before freeze", minval=0, maxval=20, group=grpX, tooltip="Pullback bars required since the last extension before the 0.297 touch may freeze the fib. Stops a single momentum candle from freezing its own retracement. Sphinx default 2; 0 disables.")
+fibZeroCross = input.int(8,  "Max 0% crosses before invalidation", minval=1, maxval=50, group=grpX, tooltip="A frozen fib whose swing point (the 0% line) gets chopped through more than this many times is stale - deleted without an outcome. Sphinx default 8.")
+fibKeepBars = input.int(4,   "Keep fib N bars after stop/TP2 hit", minval=0, maxval=50, group=grpX)
+fibShowTrack = input.bool(true, "Draw live while tracking (pre-freeze)", group=grpX, tooltip="Draw the fib while the leg is still extending, once it passes the minimum range. OFF = the fib only appears at freeze.")
+colFibLvl  = input.color(#B0BEC5, "Levels", inline="fbc", group=grpX)
+colFibStop = input.color(#EF5350, "Stop",   inline="fbc", group=grpX)
+colFibTp   = input.color(#26A69A, "TPs",    inline="fbc", group=grpX)
+
+grpT = "16. Trade levels (entry / stop / target)"
+tlOn = input.bool(true, "Draw entry / stop / target on each signal", group=grpT, tooltip="A signal marker says a setup fired; it does not say what the trade is. With this on, every LONG/SHORT signal also draws the three prices that define it: the entry, a stop behind the swing the sweep ran, and a target a fixed multiple of that risk away.\n\nDisplay only. Nothing in this group gates, arms or cancels a signal, so the triangles, the alerts and the sample-size counters read exactly the same with it off.")
+tlEntry = input.string("Next bar open", "Entry price", options=["Next bar open", "Signal bar close"], group=grpT, tooltip="Next bar open: the fill a market order sent on the signal would actually get, which is what the entry triangle above means by 'enter next bar'. The levels appear one bar after the signal, because the open they are measured from does not exist until then.\n\nSignal bar close: draws immediately on the signal bar at its close. Faster to read while a bar is live, but it prices a fill nobody got.")
+tlSlSrc = input.string("Recent swing point", "Stop anchor", options=["Recent swing point", "Signal bar wick"], group=grpT, tooltip="Recent swing point: the last confirmed fractal swing on the stop side, extended to the extreme printed since it. While price holds above that swing the stop sits on the swing itself; once the sweep trades through it the stop follows the sweep wick, so a stop is never left inside the candle that triggered the entry. The target label says which of the two the stop landed on.\n\nSignal bar wick: the trigger candle's own low (long) or high (short), the tighter and more aggressive stop.")
+tlPivN = input.int(5, "Swing strength for the stop (bars each side)", minval=1, maxval=50, group=grpT, tooltip="Pivot strength used to find the stop's swing. Independent of group 06's swing marks, which are display-only and default to 10: a stop wants the nearer structure, a chart mark wants the bigger one. Raise it for stops further back and fewer, wider setups.")
+tlBuf = input.int(2, "Stop buffer (ticks beyond the swing)", minval=0, group=grpT, tooltip="Ticks added beyond the swing so the stop sits behind the wick rather than exactly on it. 2 ticks is 0.5 points on MNQ.")
+tlRR = input.float(1.0, "Target at N x risk (R)", minval=0.25, step=0.25, group=grpT, tooltip="Distance to the target as a multiple of the stop distance. 1.0 puts the target exactly one R away, the same distance as the stop.")
+tlMaxPts = input.float(0.0, "Skip setups with risk wider than (points, 0 = off)", minval=0.0, step=5.0, group=grpT, tooltip="A swing stop can land 100+ points away after a wide sweep, which is not a trade a Combine account can take. Above 0, a setup whose stop is further than this draws no levels at all.\n\nThe signal itself still fires: the triangle, the alert and the counters are untouched, so this filter never silently changes what the indicator reports.")
+tlBars = input.int(24, "Level length (bars)", minval=3, maxval=200, group=grpT, tooltip="How far forward the three lines and their zones extend from the signal bar.")
+tlKeep = input.int(6, "Keep the last N setups on the chart", minval=1, maxval=40, group=grpT, tooltip="Older setups are deleted once this many newer ones exist. TradingView caps a script at 500 lines, 500 boxes and 500 labels total, shared with the level lines, gap boxes and sweep markers, so an uncapped trade history would starve them on a long chart.")
+tlZones_i = input.bool(true, "Shade the risk and reward zones", group=grpT, tooltip="Fills entry-to-stop in the bear colour and entry-to-target in the bull colour, the way the VLS indicator draws them. Off leaves the three lines alone. Chart density Minimal drops the shading and keeps the lines.")
+tlLabel = input.bool(true, "Price label at the target", group=grpT, tooltip="One line at the end of the levels carrying direction, entry, stop, target, the R multiple and the risk in points, plus whether the stop sat on the swing or on the sweep wick.")
+
 // ── Density-adjusted toggles ────────────────────────────────────────
 // Each drawing switch below is its own input ANDed with the density
 // choice, so lowering the density can hide an element but never reveal
@@ -215,6 +262,7 @@ bool usePD      = usePD_i      and not dMin
 bool useSwings  = useSwings_i  and not dMin
 bool htfFvgShow = htfFvgShow_i and not dMin
 bool showStatus = showStatus_i and not dMin
+bool tlZones    = tlZones_i    and not dMin
 
 
 tzNY = "America/New_York"
@@ -1035,6 +1083,164 @@ plotshape(sigShort, "Signal short (enter next bar)", shape.triangledown, locatio
 plotshape(sigLong, "Signal long (enter next bar)", shape.triangleup, location.belowbar, color.green, size=size.small, display=display.pane)
 bgcolor(armDir.size() > 0 ? color.new(color.yellow, 92) : na, title="Armed (level swept, waiting for trigger)")
 
+// ── Trade levels: entry / stop / target (group 16) ───────────────────
+// The trade each signal implies, drawn the way the VLS indicator draws
+// it: entry, a stop behind the swing the sweep ran, and a target tlRR
+// times that risk away. Display only - no branch below writes sigLong,
+// sigShort or any counter, so a setup the risk filter skips still fires
+// its triangle and its alert.
+//
+// The stop anchor. A fractal confirms tlPivN bars AFTER its swing bar,
+// so the last confirmed swing on its own can sit above the wick that
+// triggered the entry. The running extreme fixes that: it restarts at
+// each confirmed swing and then tracks the lowest low (highest high)
+// printed since, so it IS the swing until price trades through it and
+// the sweep wick once it does.
+
+float tlPvLo = ta.pivotlow(tlPivN, tlPivN)
+float tlPvHi = ta.pivothigh(tlPivN, tlPivN)
+var float tlSwLo  = na   // last confirmed swing low  (the structural stop)
+var float tlSwHi  = na
+var float tlRunLo = na   // lowest low printed since that swing confirmed
+var float tlRunHi = na
+if not na(tlPvLo)
+    tlSwLo  := tlPvLo
+    tlRunLo := tlPvLo
+if not na(tlPvHi)
+    tlSwHi  := tlPvHi
+    tlRunHi := tlPvHi
+tlRunLo := na(tlRunLo) ? low  : math.min(tlRunLo, low)
+tlRunHi := na(tlRunHi) ? high : math.max(tlRunHi, high)
+
+var array<line>  tlLn = array.new<line>()
+var array<label> tlLb = array.new<label>()
+var array<box>   tlBx = array.new<box>()
+
+// oldest setups go first: the 500-drawing cap is shared with the level
+// lines, gap boxes and sweep markers, which must not be starved.
+f_tlCull() =>
+    while tlLn.size() > tlKeep * 3
+        line.delete(tlLn.shift())
+    while tlBx.size() > tlKeep * 2
+        box.delete(tlBx.shift())
+    while tlLb.size() > tlKeep
+        label.delete(tlLb.shift())
+    true
+
+// a setup is drawable when the stop is a real distance away and, when
+// the risk cap is on, inside it
+f_tlOk(float entry, float sl) =>
+    float r = math.abs(entry - sl)
+    r > tick / 2 and (tlMaxPts <= 0 or r <= tlMaxPts)
+
+// returns the target price so the caller can export it
+f_tlDraw(int d, float entry, float sl, int x0, bool atSwing) =>
+    float risk = math.abs(entry - sl)
+    float tp   = d == 1 ? entry + tlRR * risk : entry - tlRR * risk
+    int   x1   = x0 + tlBars
+    if tlZones
+        tlBx.push(box.new(x0, math.max(entry, sl), x1, math.min(entry, sl),
+             border_color=color.new(colBear, 60), bgcolor=color.new(colBear, 88)))
+        tlBx.push(box.new(x0, math.max(entry, tp), x1, math.min(entry, tp),
+             border_color=color.new(colBull, 60), bgcolor=color.new(colBull, 88)))
+    tlLn.push(line.new(x0, entry, x1, entry, color=color.new(color.gray, 15), style=line.style_dotted))
+    tlLn.push(line.new(x0, sl,    x1, sl,    color=color.new(colBear, 0),     style=line.style_solid))
+    tlLn.push(line.new(x0, tp,    x1, tp,    color=color.new(colBull, 0),     style=line.style_solid))
+    if tlLabel
+        color tlCol = d == 1 ? colBull : colBear
+        string tlTxt = (d == 1 ? "LONG" : "SHORT")
+             + "  E " + str.tostring(entry, format.mintick)
+             + "   SL " + str.tostring(sl, format.mintick) + (atSwing ? " (swing)" : " (wick)")
+             + "   TP " + str.tostring(tp, format.mintick) + "  " + str.tostring(tlRR, "#.##") + "R"
+             + "   risk " + str.tostring(risk, format.mintick)
+        tlLb.push(label.new(x1, tp, tlTxt, style=label.style_label_left,
+             color=color.new(tlCol, 78), textcolor=color.new(tlCol, 0), size=labSz))
+    f_tlCull()
+    tp
+
+// pending setup, held from the signal bar to the bar whose open fills it
+var int   tlPBar = na
+var float tlPLSl = na    // pending long stop  (na = no pending long)
+var float tlPSSl = na    // pending short stop
+var bool  tlPLSw = false // that stop sat on the swing, not the sweep wick
+var bool  tlPSSw = false
+
+// one row per drawn setup, for the CSV test bench
+float tlXEntry = na
+float tlXStop  = na
+float tlXTgt   = na
+float tlXRisk  = na
+float tlXDir   = na
+
+bool  tlNext = tlEntry == "Next bar open"
+float tlBufP = tlBuf * tick
+
+// Drawing the pending setup runs BEFORE capturing a new one: a signal on
+// the very next bar would otherwise overwrite the pending slot and the
+// first setup would never be drawn.
+if tlOn and tlNext and not na(tlPBar) and bar_index == tlPBar + 1
+    if not na(tlPLSl)
+        float eL = open
+        float sL = math.min(tlPLSl, eL - tick)   // a long stop must sit below the fill
+        if f_tlOk(eL, sL)
+            tlXTgt   := f_tlDraw(1, eL, sL, tlPBar, tlPLSw)
+            tlXEntry := eL
+            tlXStop  := sL
+            tlXRisk  := eL - sL
+            tlXDir   := 1.0
+    if not na(tlPSSl)
+        float eS = open
+        float sS = math.max(tlPSSl, eS + tick)
+        if f_tlOk(eS, sS)
+            tlXTgt   := f_tlDraw(-1, eS, sS, tlPBar, tlPSSw)
+            tlXEntry := eS
+            tlXStop  := sS
+            tlXRisk  := sS - eS
+            tlXDir   := -1.0
+    tlPBar := na
+    tlPLSl := na
+    tlPSSl := na
+
+if tlOn and (sigLong or sigShort)
+    float tlSlL = (tlSlSrc == "Signal bar wick" ? low  : nz(tlRunLo, low))  - tlBufP
+    float tlSlS = (tlSlSrc == "Signal bar wick" ? high : nz(tlRunHi, high)) + tlBufP
+    // still resting on the swing itself, or already pushed down to the wick
+    bool tlSwgL = tlSlSrc != "Signal bar wick" and not na(tlSwLo) and tlRunLo >= tlSwLo - tick / 2
+    bool tlSwgS = tlSlSrc != "Signal bar wick" and not na(tlSwHi) and tlRunHi <= tlSwHi + tick / 2
+    if tlNext
+        tlPBar := bar_index
+        tlPLSl := sigLong  ? tlSlL : na
+        tlPSSl := sigShort ? tlSlS : na
+        tlPLSw := tlSwgL
+        tlPSSw := tlSwgS
+    else
+        if sigLong
+            float cL = close
+            float kL = math.min(tlSlL, cL - tick)
+            if f_tlOk(cL, kL)
+                tlXTgt   := f_tlDraw(1, cL, kL, bar_index, tlSwgL)
+                tlXEntry := cL
+                tlXStop  := kL
+                tlXRisk  := cL - kL
+                tlXDir   := 1.0
+        if sigShort
+            float cS = close
+            float kS = math.max(tlSlS, cS + tick)
+            if f_tlOk(cS, kS)
+                tlXTgt   := f_tlDraw(-1, cS, kS, bar_index, tlSwgS)
+                tlXEntry := cS
+                tlXStop  := kS
+                tlXRisk  := kS - cS
+                tlXDir   := -1.0
+
+// Export. In "Next bar open" mode these print one bar AFTER the signal
+// triangle, because that is the bar the fill happens on.
+plot(tlXEntry, "Trade: entry",  display=display.data_window)
+plot(tlXStop,  "Trade: stop",   display=display.data_window)
+plot(tlXTgt,   "Trade: target", display=display.data_window)
+plot(tlXRisk,  "Trade: risk (points)", display=display.data_window)
+plot(tlXDir,   "Trade: direction (+1 long, -1 short)", display=display.data_window)
+
 // ── Macro dealing range: premium/discount (merged from the standalone
 // "Macro Dealing Range & Premium/Discount" indicator) ────────────────
 
@@ -1490,3 +1696,237 @@ plot(pdwOn ? pdH : na, "Prior day high",  display=display.data_window)
 plot(pdwOn ? pdL : na, "Prior day low",   display=display.data_window)
 plot(pwkOn ? pwH : na, "Prior week high", display=display.data_window)
 plot(pwkOn ? pwL : na, "Prior week low",  display=display.data_window)
+
+// ── VWAP (group 14) ─────────────────────────────────────────────────
+// Anchored volume-weighted average price with stdev bands, accumulated
+// manually so the anchor can be a day, a week, or one of group 01's
+// session opens. Display and export only: never feeds the arming logic.
+
+string vwSessStr = vwapAnchor == "NY session" ? nySess : vwapAnchor == "London session" ? loSess : asSess
+bool vwInSess  = not na(time(timeframe.period, vwSessStr, tzNY))
+bool vwSessOpen = vwInSess and not vwInSess[1]
+bool vwReset = vwapAnchor == "Day" ? newDayBar : vwapAnchor == "Week" ? newWeekBar : vwSessOpen
+
+var float vwSumPV  = 0.0
+var float vwSumV   = 0.0
+var float vwSumPV2 = 0.0
+if vwReset
+    vwSumPV  := 0.0
+    vwSumV   := 0.0
+    vwSumPV2 := 0.0
+float vwSrc = hlc3
+float vwVol = nz(volume)
+if vwVol > 0
+    vwSumPV  += vwSrc * vwVol
+    vwSumV   += vwVol
+    vwSumPV2 += vwSrc * vwSrc * vwVol
+
+float vwapVal = vwSumV > 0 ? vwSumPV / vwSumV : na
+float vwVar   = vwSumV > 0 ? math.max(vwSumPV2 / vwSumV - vwapVal * vwapVal, 0.0) : na
+float vwSd    = math.sqrt(vwVar)
+
+plot(vwapOn ? vwapVal : na, "VWAP", color=color.new(colVwap, 0), linewidth=2, style=plot.style_linebr)
+plot(vwapOn and vwapBand1 ? vwapVal + vwapMult1 * vwSd : na, "VWAP +1 band", color=color.new(colVwBand, 40), style=plot.style_linebr)
+plot(vwapOn and vwapBand1 ? vwapVal - vwapMult1 * vwSd : na, "VWAP -1 band", color=color.new(colVwBand, 40), style=plot.style_linebr)
+plot(vwapOn and vwapBand2 ? vwapVal + vwapMult2 * vwSd : na, "VWAP +2 band", color=color.new(colVwBand, 60), style=plot.style_linebr)
+plot(vwapOn and vwapBand2 ? vwapVal - vwapMult2 * vwSd : na, "VWAP -2 band", color=color.new(colVwBand, 60), style=plot.style_linebr)
+// export: signed distance from VWAP in points, for the threshold test bench
+plot(vwapOn ? close - vwapVal : na, "VWAP: close minus vwap (points)", display=display.data_window)
+
+// ── Sphinx fib overlay (group 15) ───────────────────────────────────
+// Port of the Sphinx Fibrillator lifecycle: track a swing leg, freeze the
+// fib when price pulls back to the 0.297 retracement, keep it until the
+// 0.7 stop or -0.297 extension is hit or the 0% line chops through too
+// many times. "Pro sweeps" mode anchors the leg on this indicator's own
+// armed sweep, so the fib prices the pullback into the same reversal the
+// iFVG trigger trades. Display and export only.
+
+float fibEma = ta.ema(close, fibEmaLen)
+bool  fibTrendUp = close > fibEma
+bool  fibTrendDn = close < fibEma
+
+// compact ZigZag (Sphinx core): newest pivot pair, flat [value, barIndex]
+float fibPh = ta.highestbars(high, fibZzPrd) == 0 ? high : na
+float fibPl = ta.lowestbars(low, fibZzPrd) == 0 ? low : na
+var int fibZzDir = 0
+fibZzDir := not na(fibPh) and na(fibPl) ? 1 : not na(fibPl) and na(fibPh) ? -1 : fibZzDir
+var array<float> fibZz = array.new_float()
+bool fibZzChanged = fibZzDir != fibZzDir[1]
+if fibOn and (not na(fibPh) or not na(fibPl))
+    float zv = fibZzDir == 1 ? fibPh : fibPl
+    if fibZzChanged or fibZz.size() == 0
+        fibZz.unshift(bar_index)
+        fibZz.unshift(zv)
+        if fibZz.size() > 10
+            fibZz.pop()
+            fibZz.pop()
+    else if (fibZzDir == 1 and zv > fibZz.get(0)) or (fibZzDir == -1 and zv < fibZz.get(0))
+        fibZz.set(0, zv)
+        fibZz.set(1, bar_index)
+
+// fib price: level 0 = the tracked extreme, level 1 = the anchor
+f_fibPrice(float level, float swL, float swH, bool isUp) =>
+    float diff = swH - swL
+    isUp ? swL + diff * (1 - level) : swH - diff * (1 - level)
+
+// tracking + frozen-fib state
+var float fibTrkHi  = na
+var float fibTrkLo  = na
+var int   fibTrkHiB = na
+var int   fibTrkLoB = na
+var bool  fibTrkUp  = false
+var bool  fibTrkOn  = false
+var int   fibBarsSinceExt = 0
+var int   fibUsedHiB = na
+var int   fibUsedLoB = na
+var float fibSwHi   = na
+var float fibSwLo   = na
+var bool  fibUp     = false
+var bool  fibFrozen = false
+var int   fibZeroCnt = 0
+var int   fibHitB   = na
+var array<line>  fibLines = array.new<line>()
+var array<label> fibLabs  = array.new<label>()
+
+f_fibClear() =>
+    if fibLines.size() > 0
+        for i = 0 to fibLines.size() - 1
+            line.delete(fibLines.get(i))
+    if fibLabs.size() > 0
+        for i = 0 to fibLabs.size() - 1
+            label.delete(fibLabs.get(i))
+    fibLines.clear()
+    fibLabs.clear()
+
+f_fibDraw(float swL, float swH, bool isUp, int anchorBar) =>
+    f_fibClear()
+    array<float>  fLv = array.from(1.0, 0.7, 0.559, 0.45, 0.297, 0.05, 0.0, -0.297)
+    array<string> fNm = array.from("SWING", "FIRM STOP", "CONSERVATIVE", "BEST", "AGGRESSIVE", "TP 1", "SWING", "TP 2")
+    for i = 0 to fLv.size() - 1
+        float lv = fLv.get(i)
+        color fc = lv == 0.7 ? colFibStop : (lv == 0.05 or lv == -0.297) ? colFibTp : colFibLvl
+        float y  = f_fibPrice(lv, swL, swH, isUp)
+        fibLines.push(line.new(anchorBar, y, bar_index, y, extend=extend.right, color=color.new(fc, 20), width=1))
+        fibLabs.push(label.new(bar_index + 6, y, fNm.get(i) + " (" + str.tostring(math.round_to_mintick(y)) + ")", style=label.style_none, textcolor=color.new(fc, 10), size=size.small))
+
+// ── start a leg ──
+if fibOn and not fibTrkOn and not fibFrozen
+    if fibSource == "Pro sweeps"
+        // this bar armed a sweep-reversal: swept low = long anchor, swept high = short
+        if xSweepDir == 1 and fibTrendUp
+            fibTrkLo  := low
+            fibTrkLoB := bar_index
+            fibTrkHi  := high
+            fibTrkHiB := bar_index
+            fibTrkUp  := true
+            fibTrkOn  := true
+        else if xSweepDir == -1 and fibTrendDn
+            fibTrkHi  := high
+            fibTrkHiB := bar_index
+            fibTrkLo  := low
+            fibTrkLoB := bar_index
+            fibTrkUp  := false
+            fibTrkOn  := true
+    else if fibZz.size() >= 4
+        float pvNew  = fibZz.get(0)
+        int   pvNewB = math.round(fibZz.get(1))
+        float pvPrv  = fibZz.get(2)
+        int   pvPrvB = math.round(fibZz.get(3))
+        float zzHi  = math.max(pvNew, pvPrv)
+        float zzLo  = math.min(pvNew, pvPrv)
+        int   zzHiB = pvNew > pvPrv ? pvNewB : pvPrvB
+        int   zzLoB = pvNew > pvPrv ? pvPrvB : pvNewB
+        bool zzReused = (not na(fibUsedHiB) and zzHiB == fibUsedHiB) and (not na(fibUsedLoB) and zzLoB == fibUsedLoB)
+        if not zzReused
+            if pvNew > pvPrv and fibTrendUp
+                fibTrkLo  := zzLo
+                fibTrkLoB := zzLoB
+                fibTrkHi  := zzHi
+                fibTrkHiB := zzHiB
+                fibTrkUp  := true
+                fibTrkOn  := true
+            else if pvNew < pvPrv and fibTrendDn
+                fibTrkHi  := zzHi
+                fibTrkHiB := zzHiB
+                fibTrkLo  := zzLo
+                fibTrkLoB := zzLoB
+                fibTrkUp  := false
+                fibTrkOn  := true
+
+// ── extend the tracked side; anchor break kills the leg ──
+bool fibExtended = false
+if fibTrkOn and not fibFrozen
+    if fibTrkUp
+        if high > fibTrkHi
+            fibTrkHi  := high
+            fibTrkHiB := bar_index
+            fibExtended := true
+        if low < fibTrkLo
+            fibTrkOn := false
+    else
+        if low < fibTrkLo
+            fibTrkLo  := low
+            fibTrkLoB := bar_index
+            fibExtended := true
+        if high > fibTrkHi
+            fibTrkOn := false
+fibBarsSinceExt := not fibTrkOn or fibExtended ? 0 : fibBarsSinceExt + 1
+
+// ── freeze on the 0.297 touch ──
+bool fibFroze = false
+if fibTrkOn and not fibFrozen and fibBarsSinceExt >= fibSettledBars
+    float fibRng = math.abs(fibTrkHi - fibTrkLo)
+    if fibRng >= fibMinSwing
+        float ent297 = f_fibPrice(0.297, fibTrkLo, fibTrkHi, fibTrkUp)
+        if fibTrkUp ? low <= ent297 : high >= ent297
+            fibSwLo   := fibTrkLo
+            fibSwHi   := fibTrkHi
+            fibUp     := fibTrkUp
+            fibFrozen := true
+            fibFroze  := true
+            fibZeroCnt := 0
+            fibHitB   := na
+            fibUsedHiB := fibTrkHiB
+            fibUsedLoB := fibTrkLoB
+            int fibAnchorB = fibTrkUp ? fibTrkLoB : fibTrkHiB
+            fibTrkOn  := false
+            f_fibDraw(fibSwLo, fibSwHi, fibUp, fibAnchorB)
+
+// ── live draw while tracking ──
+if fibOn and fibTrkOn and not fibFrozen and fibShowTrack
+    if math.abs(fibTrkHi - fibTrkLo) >= fibMinSwing and (fibExtended or fibLines.size() == 0)
+        f_fibDraw(fibTrkLo, fibTrkHi, fibTrkUp, fibTrkUp ? fibTrkLoB : fibTrkHiB)
+if not fibTrkOn and not fibFrozen and fibLines.size() > 0
+    f_fibClear()
+
+// keep the trailing labels on the latest bar
+if fibLabs.size() > 0 and (fibFrozen or fibTrkOn)
+    for i = 0 to fibLabs.size() - 1
+        label.set_x(fibLabs.get(i), bar_index + 6)
+
+// ── frozen-fib lifecycle: stop / TP2 hit, 0% chop invalidation ──
+float fibStopPx = fibFrozen ? f_fibPrice(0.7, fibSwLo, fibSwHi, fibUp) : na
+float fibTp2Px  = fibFrozen ? f_fibPrice(-0.297, fibSwLo, fibSwHi, fibUp) : na
+if fibFrozen and na(fibHitB)
+    bool hitStop = fibUp ? low <= fibStopPx : high >= fibStopPx
+    bool hitTp2  = fibUp ? high >= fibTp2Px : low <= fibTp2Px
+    if hitStop or hitTp2
+        fibHitB := bar_index
+    float zeroPx = fibUp ? fibSwHi : fibSwLo
+    if high >= zeroPx and low <= zeroPx
+        fibZeroCnt += 1
+    if fibZeroCnt > fibZeroCross
+        f_fibClear()
+        fibFrozen := false
+if fibFrozen and not na(fibHitB) and bar_index >= fibHitB + fibKeepBars
+    f_fibClear()
+    fibFrozen := false
+
+alertcondition(fibFroze, "Sphinx fib frozen", "LiqSweep+iFVG Pro: Sphinx fib frozen on {{ticker}} {{interval}} at {{close}}")
+
+// export: the frozen fib's actionable prices, for the CSV test bench
+plot(fibFrozen ? f_fibPrice(0.297, fibSwLo, fibSwHi, fibUp) : na, "Fib: aggressive entry", display=display.data_window)
+plot(fibFrozen ? fibStopPx : na, "Fib: firm stop", display=display.data_window)
+plot(fibFrozen ? f_fibPrice(0.05, fibSwLo, fibSwHi, fibUp) : na, "Fib: TP1", display=display.data_window)
+plot(fibFrozen ? fibTp2Px : na, "Fib: TP2", display=display.data_window)
+plot(fibFrozen ? (fibUp ? 1.0 : -1.0) : na, "Fib: direction (+1 long, -1 short)", display=display.data_window)
