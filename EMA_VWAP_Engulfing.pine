@@ -158,8 +158,8 @@ flatMin    = input.float(0.25, "    EMA must travel this over 15 min (x ATR)", m
 gateChop   = input.bool(true, "Block on two-sided wicks", group = grpQ, tooltip = "Skip reason 2: 'we see wicks in both directions, that means there is no clear direction'.")
 chopLook   = input.int(5, "    lookback bars", minval = 2, maxval = 20, group = grpQ)
 chopCount  = input.int(4, "    indecision bars that block", minval = 1, maxval = 20, group = grpQ)
-distBasis  = input.string("Price to fast EMA", "Late-entry measure", options = ["Price to fast EMA", "Fast EMA to VWAP"], group = grpQ, tooltip = "What 'late' means. Price to fast EMA asks how extended THIS ENTRY is, which is the question that matters and the one a trend day can still answer well. Fast EMA to VWAP asks how far the two lines have separated, which on a real expansion blows out to five or ten ATR and costs a point on every bar of the best move of the week: the check ends up punishing trending for trending. The second option is the original behaviour and is kept so you can see the difference.")
-gateDist   = input.bool(true, "Score the entry as late when it is extended", group = grpQ, tooltip = "An entry a long way from the fast EMA is a chase. With the price-to-EMA basis, one ATR is already extended; with the line-gap basis the old default was two.")
+distBasis  = input.string("Bar open to fast EMA", "Late-entry measure", options = ["Bar open to fast EMA", "Price to fast EMA", "Fast EMA to VWAP"], group = grpQ, tooltip = "What 'late' means. Bar open to fast EMA asks how far from the EMA the trigger bar STARTED, which is whether the move had already left before your signal. Price to fast EMA measures from the close instead, and a momentum bar has to tag the EMA with its low and close near its high, so its close always sits about one bar-height away: on a two to three ATR opening bar the check fails by construction and the strongest entry of the day loses a point for being strong. Fast EMA to VWAP asks how far the two lines have separated, which on a real expansion blows out to five or ten ATR and punishes trending for trending. The last two are kept so you can see the difference.")
+gateDist   = input.bool(true, "Score the entry as late when it is extended", group = grpQ, tooltip = "An entry that starts a long way from the fast EMA is a chase. With either EMA-based measure, one ATR is already extended; with the line-gap basis the old default was two.")
 distMax    = input.float(1.0, "    maximum distance (x ATR)", minval = 0.2, step = 0.1, group = grpQ)
 maxPerWin  = input.int(0, "Maximum signals per window (0 = no cap)", minval = 0, maxval = 20, group = grpQ, tooltip = "A hard ceiling on how many signals a trading window may produce. It ships OFF, and that is a measured decision rather than a preference: replayed on a real expansion day, a cap of two took the first two qualifying signals and threw away the third, which was the one that ran several hundred points. A cap selects by arrival order, and nothing at 09:00 knows what 15:00 will offer. Raise the score threshold above to get fewer signals; use this only when you want a hard daily discipline limit and accept losing the day's best trade to it.")
 confirmOnly = input.bool(true, "Signal only on closed bars", group = grpQ, tooltip = "Off means the marker can appear and vanish inside a live bar. Leave it on.")
@@ -455,9 +455,15 @@ bool chopOk  = not gateChop or chopN < chopCount
 
 bool flatOk  = not gateFlat or emaTravel >= flatMin
 // How late the entry is. The line gap grows on every good trend day, so using
-// it as the lateness measure penalises exactly the move you want to be in.
-float entryDist = vwapOk and not na(atrVal) and atrVal > 0 ? math.abs(close - ema9) / atrVal : 0.0
-float distUsed  = distBasis == "Price to fast EMA" ? entryDist : lineDist
+// it as the lateness measure penalises exactly the move you want to be in. The
+// close is no better on a momentum bar: the trigger forces the low onto the EMA
+// and the close near the high, so close-to-EMA is roughly the bar's own height.
+// On 2026-09-21 the 09:35 New York bar was 2.98 ATR tall and read 2.30 ATR
+// "late" from its close, 0.34 ATR from its open.
+bool  distOkIn  = vwapOk and not na(atrVal) and atrVal > 0
+float entryDist = distOkIn ? math.abs(close - ema9) / atrVal : 0.0
+float openDist  = distOkIn ? math.abs(open - ema9) / atrVal : 0.0
+float distUsed  = distBasis == "Bar open to fast EMA" ? openDist : distBasis == "Price to fast EMA" ? entryDist : lineDist
 bool distOk  = not gateDist or distUsed <= distMax
 bool slopeUpOk = not gateSlope or vwapSlope >= slopeMin
 bool slopeDnOk = not gateSlope or vwapSlope <= -slopeMin
@@ -1073,7 +1079,7 @@ if showDash and barstate.islast
         r := r + 1
         check(r, "Two-sided chop", str.tostring(chopN, "#") + " of " + str.tostring(chopLook), chopOk)
         r := r + 1
-        check(r, distBasis == "Price to fast EMA" ? "How extended this entry is" : "Gap, EMA to VWAP", str.tostring(distUsed, "#.##") + " ATR", distOk)
+        check(r, distBasis == "Bar open to fast EMA" ? "How far off the EMA the bar started" : distBasis == "Price to fast EMA" ? "How extended this entry is" : "Gap, EMA to VWAP",str.tostring(distUsed, "#.##") + " ATR", distOk)
         r := r + 1
         check(r, "Second EMA agrees", ema2On ? (ema9 > ema21 ? "fast above" : "fast below") : "off", sideLong ? e2UpOk : e2DnOk)
         r := r + 1
