@@ -138,7 +138,7 @@ minRangeATR = input.float(0.8, "    trigger bar must be this tall (x ATR, Custom
 wickAtEma   = input.bool(false, "    accept rejection wicks at the 9 EMA too (Custom)", group = grpQ, tooltip = "Off means only a rejection at VWAP counts. The 9 EMA is touched many times a session, so wicks there are common and cheap.")
 vetoChop    = input.bool(true, "    two-sided chop is a hard veto, not a point (Custom)", group = grpQ)
 retestBoth  = input.bool(true, "    setup D must close beyond BOTH lines (Custom)", group = grpQ, tooltip = "On means a VWAP retest entry also has to close beyond the 9 EMA, which is the zone rule: above both lines the buyers are in control and between the two lines is a do-not-trade. Off allows the entry that closes back above VWAP while still under the fast EMA, and that is the bar that leaves marks sitting between the lines.")
-minScore   = input.int(8, "Minimum confluence score to fire", minval = 0, maxval = 12, group = grpQ, tooltip = "Each quality check is worth a point instead of being a veto. Twelve points are available: volume, heavy volume, VWAP slope, EMA not flat, no two-sided chop, at a marked level, held the side for N minutes, second EMA agrees, higher timeframe agrees, lines not too far apart, reference market agrees, price on the right side of the third EMA. The reference market only scores when you switch it on, so the realistic ceiling is 11 and a score of 9 is already the top band. Eight is the default and it grades as A. Set this to 9 to take A-plus only, which is the cleanest way to get one to three signals a session without capping the count by arrival order.")
+minScorePct = input.int(65, "Minimum confluence score (% of what is reachable)", minval = 0, maxval = 100, step = 5, group = grpQ, tooltip = "A percentage rather than a count, because the count of reachable points moves with your own switches. A check that you have promoted to a hard veto no longer pays a point, since a signal cannot exist without it and a mandatory condition is not confluence. Switching off the second EMA, the third EMA, the higher timeframe or the reference market removes their points too. The dashboard shows the live ceiling beside the score. With the four default vetoes on, only six points remain reachable, so the percentage moves in steps of roughly 17 points and 65% means four of six. Replayed on two real sessions, 65% produced the three signals that included the session's biggest move and 75% produced none at all, so treat anything above 70% as a very strict setting rather than a slightly stricter one.")
 holdMinutes = input.int(15, "Minutes on one side of VWAP to count as 'held'", minval = 1, maxval = 120, group = grpQ, tooltip = "How long price has to stay on one side of VWAP before the side counts as held rather than as a passing poke. Fifteen to thirty minutes is the usual range.")
 vetoSlope  = input.bool(true, "Veto: VWAP must slope with the trade", group = grpQ, tooltip = "A fast EMA above the slow one while VWAP slopes the other way is a disagreement, not a trend. As a veto this blocks the trade outright instead of costing it one point.")
 vetoE2     = input.bool(true, "Veto: fast EMA must be on the right side of the second EMA", group = grpQ)
@@ -158,8 +158,9 @@ flatMin    = input.float(0.25, "    EMA must travel this over 15 min (x ATR)", m
 gateChop   = input.bool(true, "Block on two-sided wicks", group = grpQ, tooltip = "Skip reason 2: 'we see wicks in both directions, that means there is no clear direction'.")
 chopLook   = input.int(5, "    lookback bars", minval = 2, maxval = 20, group = grpQ)
 chopCount  = input.int(4, "    indecision bars that block", minval = 1, maxval = 20, group = grpQ)
-gateDist   = input.bool(true, "Block when the two lines are too far apart", group = grpQ, tooltip = "When the fast EMA and VWAP have separated a long way, the move already happened and an entry here is just late.")
-distMax    = input.float(2.0, "    max |EMA - VWAP| (x ATR)", minval = 0.2, step = 0.1, group = grpQ)
+distBasis  = input.string("Price to fast EMA", "Late-entry measure", options = ["Price to fast EMA", "Fast EMA to VWAP"], group = grpQ, tooltip = "What 'late' means. Price to fast EMA asks how extended THIS ENTRY is, which is the question that matters and the one a trend day can still answer well. Fast EMA to VWAP asks how far the two lines have separated, which on a real expansion blows out to five or ten ATR and costs a point on every bar of the best move of the week: the check ends up punishing trending for trending. The second option is the original behaviour and is kept so you can see the difference.")
+gateDist   = input.bool(true, "Score the entry as late when it is extended", group = grpQ, tooltip = "An entry a long way from the fast EMA is a chase. With the price-to-EMA basis, one ATR is already extended; with the line-gap basis the old default was two.")
+distMax    = input.float(1.0, "    maximum distance (x ATR)", minval = 0.2, step = 0.1, group = grpQ)
 maxPerWin  = input.int(0, "Maximum signals per window (0 = no cap)", minval = 0, maxval = 20, group = grpQ, tooltip = "A hard ceiling on how many signals a trading window may produce. It ships OFF, and that is a measured decision rather than a preference: replayed on a real expansion day, a cap of two took the first two qualifying signals and threw away the third, which was the one that ran several hundred points. A cap selects by arrival order, and nothing at 09:00 knows what 15:00 will offer. Raise the score threshold above to get fewer signals; use this only when you want a hard daily discipline limit and accept losing the day's best trade to it.")
 confirmOnly = input.bool(true, "Signal only on closed bars", group = grpQ, tooltip = "Off means the marker can appear and vanish inside a live bar. Leave it on.")
 
@@ -232,7 +233,7 @@ hubNoRep = input.bool(true, "    wait for the higher-timeframe bar to close", gr
 
 // ── 08b. Resolve the quality preset ─────────────────────────────────────────
 bool  isCustom    = qualMode == "Custom"
-int   minScoreUse = isCustom ? minScore : qualMode == "Strict" ? 6 : qualMode == "Balanced" ? 5 : 4
+int   minPctUse   = isCustom ? minScorePct : qualMode == "Strict" ? 80 : qualMode == "Balanced" ? 65 : 50
 int   coolMinUse  = isCustom ? cooldownMin : qualMode == "Strict" ? 60 : qualMode == "Balanced" ? 40 : 0
 float wickUse     = isCustom ? wickFrac : qualMode == "Strict" ? 0.55 : qualMode == "Balanced" ? 0.50 : 0.45
 float minRngUse   = isCustom ? minRangeATR : qualMode == "Strict" ? 0.8 : qualMode == "Balanced" ? 0.6 : 0.4
@@ -453,7 +454,11 @@ float chopN  = math.sum(indecis ? 1 : 0, chopLook)
 bool chopOk  = not gateChop or chopN < chopCount
 
 bool flatOk  = not gateFlat or emaTravel >= flatMin
-bool distOk  = not gateDist or lineDist <= distMax  // applied to setup A only, see baseOk
+// How late the entry is. The line gap grows on every good trend day, so using
+// it as the lateness measure penalises exactly the move you want to be in.
+float entryDist = vwapOk and not na(atrVal) and atrVal > 0 ? math.abs(close - ema9) / atrVal : 0.0
+float distUsed  = distBasis == "Price to fast EMA" ? entryDist : lineDist
+bool distOk  = not gateDist or distUsed <= distMax
 bool slopeUpOk = not gateSlope or vwapSlope >= slopeMin
 bool slopeDnOk = not gateSlope or vwapSlope <= -slopeMin
 
@@ -654,8 +659,32 @@ bool e2DnOk = not ema2On or ema9 < ema21
 bool e3UpOk = not ema3On or close > ema200
 bool e3DnOk = not ema3On or close < ema200
 
-int scoreLong = (volOk ? 1 : 0) + (rvol >= volMult * 1.5 ? 1 : 0) + (slopeUpOk ? 1 : 0) + (flatOk ? 1 : 0) + (chopOk ? 1 : 0) + (atLevel ? 1 : 0) + (heldLong ? 1 : 0) + (e2UpOk and ema2On ? 1 : 0) + (htfUpOk and htfOn ? 1 : 0) + (distOk ? 1 : 0) + (refUpOk and refOn ? 1 : 0) + (e3UpOk and ema3On ? 1 : 0)
-int scoreShort = (volOk ? 1 : 0) + (rvol >= volMult * 1.5 ? 1 : 0) + (slopeDnOk ? 1 : 0) + (flatOk ? 1 : 0) + (chopOk ? 1 : 0) + (atLevel ? 1 : 0) + (heldShort ? 1 : 0) + (e2DnOk and ema2On ? 1 : 0) + (htfDnOk and htfOn ? 1 : 0) + (distOk ? 1 : 0) + (refDnOk and refOn ? 1 : 0) + (e3DnOk and ema3On ? 1 : 0)
+// A point is only confluence if the signal could have existed without it. Every
+// check promoted to a hard veto is mandatory, so it stops paying a point, and
+// volume pays once rather than twice for the same number. Both were real
+// double-counts: with the three default vetoes on, a signal used to bank three
+// of its points before anything was measured, and one strong-volume bar banked
+// two more from a single reading.
+bool payVol   = volOk
+bool paySlopeL = not vetoSlope and slopeUpOk
+bool paySlopeS = not vetoSlope and slopeDnOk
+bool payFlat  = flatOk
+bool payChop  = not chopVetoUse and chopOk
+bool payLvl   = atLevel
+bool payE2L   = ema2On and not vetoE2 and e2UpOk
+bool payE2S   = ema2On and not vetoE2 and e2DnOk
+bool payHtfL  = htfOn and not vetoHtf and htfUpOk
+bool payHtfS  = htfOn and not vetoHtf and htfDnOk
+bool payDist  = distOk
+bool payRefL  = refOn and refUpOk
+bool payRefS  = refOn and refDnOk
+bool payE3L   = ema3On and not vetoE3 and e3UpOk
+bool payE3S   = ema3On and not vetoE3 and e3DnOk
+
+int scoreMax = 1 + (vetoSlope ? 0 : 1) + 1 + (chopVetoUse ? 0 : 1) + 1 + 1 + (ema2On and not vetoE2 ? 1 : 0) + (htfOn and not vetoHtf ? 1 : 0) + 1 + (refOn ? 1 : 0) + (ema3On and not vetoE3 ? 1 : 0)
+int scoreLong  = (payVol ? 1 : 0) + (paySlopeL ? 1 : 0) + (payFlat ? 1 : 0) + (payChop ? 1 : 0) + (payLvl ? 1 : 0) + (heldLong ? 1 : 0) + (payE2L ? 1 : 0) + (payHtfL ? 1 : 0) + (payDist ? 1 : 0) + (payRefL ? 1 : 0) + (payE3L ? 1 : 0)
+int scoreShort = (payVol ? 1 : 0) + (paySlopeS ? 1 : 0) + (payFlat ? 1 : 0) + (payChop ? 1 : 0) + (payLvl ? 1 : 0) + (heldShort ? 1 : 0) + (payE2S ? 1 : 0) + (payHtfS ? 1 : 0) + (payDist ? 1 : 0) + (payRefS ? 1 : 0) + (payE3S ? 1 : 0)
+int minScoreUse = math.max(1, int(math.ceil(scoreMax * minPctUse / 100.0)))
 
 // Three checks can be promoted from a point to an absolute. A fast EMA above
 // the slow one while VWAP slopes the other way is a disagreement, not a trend,
@@ -869,12 +898,13 @@ if shapeLong or shapeShort
     blockedLong  := shapeLong and not longFire
     blockedShort := shapeShort and not shortFire
 
-// A letter for the score, so "is this an A-plus setup" has an answer on the
-// chart instead of in your head. Twelve points exist but eleven are reachable
-// with the reference market off, and the level point pays rarely, so the bands
-// sit where real signals land rather than where the arithmetic ceiling is.
-grade(int sc) =>
-    sc >= 9 ? "A+" : sc >= 8 ? "A" : sc >= 6 ? "B" : "C"
+// A letter for the score, graded against what is reachable on YOUR settings
+// rather than against a fixed twelve. Turning a check into a veto or
+// switching a line off removes it from both sides of the fraction, so the
+// grade keeps meaning the same thing.
+grade(int sc, int mx) =>
+    float f = mx > 0 ? sc / float(mx) : 0.0
+    f >= 0.90 ? "A+" : f >= 0.75 ? "A" : f >= 0.60 ? "B" : "C"
 
 // ── 15. Plots ───────────────────────────────────────────────────────────────
 plot(ema9, "EMA 9", color = colEmaUse, linewidth = 2)
@@ -902,7 +932,7 @@ plotshape(showBlocked and blockedLong ? low : na, "Blocked long", shape.circle, 
 plotshape(showBlocked and blockedShort ? high : na, "Blocked short", shape.circle, location.absolute, color = color.new(colChop, 25), size = size.tiny)
 
 if showLabel and (longFire or shortFire)
-    string txt = setupTag == "E" ? "E " + (longFire ? "long" : "short") + " fade to VWAP" : grade(longFire ? scoreLong : scoreShort) + " " + setupTag + (longFire ? " long " : " short ") + str.tostring(longFire ? scoreLong : scoreShort) + "/12" + (atLevel ? " @lvl" : "") + ((longFire ? zoneLong : zoneShort) ? "" : " [VWAP only]")
+    string txt = setupTag == "E" ? "E " + (longFire ? "long" : "short") + " fade to VWAP" : grade(longFire ? scoreLong : scoreShort, scoreMax) + " " + setupTag + (longFire ? " long " : " short ") + str.tostring(longFire ? scoreLong : scoreShort) + "/" + str.tostring(scoreMax) + (atLevel ? " @lvl" : "") + ((longFire ? zoneLong : zoneShort) ? "" : " [VWAP only]")
     label.new(bar_index, longFire ? low - 1.2 * atrVal : high + 1.2 * atrVal, txt, style = longFire ? label.style_label_up : label.style_label_down, color = longFire ? colLong : colShort, textcolor = color.white, size = size.small)
 
 // ── 15b. Higher-timeframe trend, context only ───────────────────────────────
@@ -1006,7 +1036,7 @@ if showDash and barstate.islast
     table.cell(dash, 2, r, winTxt, text_size = dashTxt, text_color = inTrade ? colLong : color.gray, text_halign = text.align_right, bgcolor = cSectBg)
     r := r + 1
     table.cell(dash, 0, r, verdict, text_size = dashTxt, text_color = verdCol, text_halign = text.align_left)
-    table.cell(dash, 1, r, grade(sc) + " " + str.tostring(sc) + "/12", text_size = dashTxt, text_color = sc >= minScoreUse ? colLong : colChop, text_halign = text.align_right)
+    table.cell(dash, 1, r, grade(sc, scoreMax) + " " + str.tostring(sc) + "/" + str.tostring(scoreMax), text_size = dashTxt, text_color = sc >= minScoreUse ? colLong : colChop, text_halign = text.align_right)
     table.cell(dash, 2, r, "need " + str.tostring(minScoreUse), text_size = dashTxt, text_color = cLabel, text_halign = text.align_right)
     r := r + 1
     if hubOn
@@ -1043,7 +1073,7 @@ if showDash and barstate.islast
         r := r + 1
         check(r, "Two-sided chop", str.tostring(chopN, "#") + " of " + str.tostring(chopLook), chopOk)
         r := r + 1
-        check(r, "Gap, EMA to VWAP", str.tostring(lineDist, "#.##") + " ATR", distOk)
+        check(r, distBasis == "Price to fast EMA" ? "How extended this entry is" : "Gap, EMA to VWAP", str.tostring(distUsed, "#.##") + " ATR", distOk)
         r := r + 1
         check(r, "Second EMA agrees", ema2On ? (ema9 > ema21 ? "fast above" : "fast below") : "off", sideLong ? e2UpOk : e2DnOk)
         r := r + 1
