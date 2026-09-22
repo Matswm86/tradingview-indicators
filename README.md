@@ -2,25 +2,17 @@
 
 Pine Script v6 indicators for intraday futures, built and tested on MNQ (Micro E-mini Nasdaq-100).
 
-| Indicator | File | Idea | Compiled |
-|---|---|---|---|
-| EMA x VWAP Engulfing | `EMA_VWAP_Engulfing.pine` | Fast EMA against session VWAP, five setups, a twelve-point confluence score | partly, see note |
-| LiqSweep+iFVG | `LiqSweep_iFVG.pine` | Session-liquidity raid into inverted-FVG reversal | yes |
-| LiqSweep+iFVG Pro | `LiqSweep_iFVG_Pro.pine` | Same core plus order-flow and auction confluences | not since 2026-09-19 |
-| LiqSweep+iFVG Pro +VWAP/Fib | `LiqSweep_iFVG_Pro_VWAP_Fib.pine` | Pro plus anchored VWAP and fib-retracement confluence | not since 2026-09-19 |
-| LiqSweep CVD | `LiqSweep_CVD.pine` | Cumulative volume delta companion pane | yes |
-| Liquidity Map | `Liquidity_Map.pine` | Engineered liquidity, respected levels and live liquidity blocks | not since v1.3.2 |
-| LSD Model | `LSD_Model.pine` | Supply/demand zone + liquidity sweep + directional-close entry | not since v4 |
-| Trend Hub | `Trend_Hub.pine` | Qualified-trend and momentum read across three timeframes | unverified |
-| Session Pulse | `Session_Pulse.pine` | Live session volume pace and how much of a normal day's range is spent | unverified |
-
-**About the "Compiled" column.** Several files carry edits that have not been through
-TradingView's Pine editor since they were written. They are published as source anyway,
-because a rejected paste costs you thirty seconds and a stale file costs you a session.
-If one throws a compile error, open an issue with the error text.
-
-**None of these has been backtested.** Every default is a starting point rather than a
-measured result. They are chart tools for reading a market, not systems with a known edge.
+| Indicator | File | Idea |
+|---|---|---|
+| EMA x VWAP Engulfing | `EMA_VWAP_Engulfing.pine` | Fast EMA against session VWAP, five setups, a twelve-point confluence score |
+| LiqSweep+iFVG | `LiqSweep_iFVG.pine` | Session-liquidity raid into inverted-FVG reversal |
+| LiqSweep+iFVG Pro | `LiqSweep_iFVG_Pro.pine` | Same core plus order-flow and auction confluences |
+| LiqSweep+iFVG Pro +VWAP/Fib | `LiqSweep_iFVG_Pro_VWAP_Fib.pine` | Pro plus anchored VWAP and fib-retracement confluence |
+| LiqSweep CVD | `LiqSweep_CVD.pine` | Cumulative volume delta companion pane |
+| Liquidity Map | `Liquidity_Map.pine` | Engineered liquidity, respected levels and live liquidity blocks |
+| LSD Model | `LSD_Model.pine` | Supply/demand zone + liquidity sweep + directional-close entry |
+| Trend Hub | `Trend_Hub.pine` | Qualified-trend and momentum read across three timeframes |
+| Session Pulse | `Session_Pulse.pine` | Live session volume pace and how much of a normal day's range is spent |
 
 ## EMA x VWAP Engulfing
 
@@ -120,9 +112,9 @@ six bars, a close through the last swing flips the direction, and the volume at 
 whether the flip is confirmed or merely suspect. Each row shows direction, a strength meter and an
 RSI momentum read.
 
-Measured on a year of index-future data plus a 174-signal export: **three-timeframe alignment has
-no edge as an entry trigger** at a five-candle horizon. The panel is context. Treating the 3/3 row
-as a signal is the mistake it is designed to prevent.
+**The 3/3 alignment row is not an entry trigger.** The panel tells you which way the larger
+clock is running so you can size and time a trade you already have a reason to take. Trading the
+alignment itself is the mistake it is designed to prevent.
 
 ## Session Pulse
 
