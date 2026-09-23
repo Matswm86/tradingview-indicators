@@ -11,24 +11,38 @@
 //        9-hour max structure age (his number), short-term trend gate at the BOS bar, straight-line approach cap,
 //        break-of-structure leg cap, HTF 30m/1h flip alert, tap depth + tap volume flags, A/B/C grade in the label,
 //        same-bar signal when the tap candle itself closes in direction.
-// Rev 2026-09-19 (v4, first frame-by-frame audit of his recorded trades). NOT compiled.
+// Rev 2026-09-19 (v4, first frame-by-frame audit of his recorded trades). Compiled on TradingView 2026-09-23.
 //   v4.1 nine-hour clock runs from the zone's BASE candle (his measure tool: '109 bars, 9h 5m' from the base candle, frame 00010528),
 //        not from the detection bar 1 to 4 bars later.
 //   v4.2 source look: supply zones the same light green as demand, optional 'Demand Zone' / 'Supply Zone' text, liquidity as a thin
 //        solid line in the Liquidity colour (default black) with the word 'Liquidity' on it (frame 00004400).
 //   v4.3 straight-line counter restarts whenever the structure makes a new extreme, so it counts retracement swings on the FINAL leg
-//        into the zone only (what he calls a straight line). Replay of 9 of his trades on real 5m bars, research/lsd/
-//        replay_mangoe_trades_2026-09-19.py: the count moves to his own read on 2 of 3 measurable trades (R2 1 -> 0, R3 2 -> 1) and no
+//        into the zone only (what he calls a straight line). Replay of 9 of his trades on real 5m bars:
+//        the count moves to his own read on 2 of 3 measurable trades (R2 1 -> 0, R3 2 -> 1) and no
 //        signal changes. The cap stays at 1: the replay found NO trade of his killed by it, so the audit's 'raise it to 6' is not applied.
+// Rev 2026-09-23 (v5, bar-by-bar trace of the 7 real trades of his that v4 missed, replayed on 5m CFD bars). NOT compiled.
+//   v5.1 a zone is tapped only by an OPPOSITE-colour candle, at birth and before the break of structure. RD_Forex (2026 course):
+//        'No bearish candles can have come back to a demand zone'; Mangoe: 'as soon as another bearish candle touches our demand
+//        zone, that means it is a tapped zone'. v4 killed a zone on ANY later candle touching the base candle, which rejected
+//        his base candle on 5 of 9 replayed trades (one by 0.3 points on gold).
+//   v5.2 after the break of structure, a new swing on the way back to the zone is a retracement on the approach, not new
+//        liquidity that needs its own break. It becomes the liquidity only if price breaks structure again (his staircase).
+//        v4 reset those setups and killed them as 'touch' at the tap: two of his wins (NQ 23 Jul, gold 27 Jul).
+//   v5.3 straight-line cap 1 -> 2 retracement swings: his 'only one small retracement' prints two 1-bar pivots on NQ 23 Jul.
+//   Replay (MWM calc, CFD feed, the same 9 trades the fixes were designed on): 4 of 9 entries to the minute (v4: 2), a fifth
+//   20 min early, his two losses still unsignalled. MNQ 5m: about 1.4-2.2 signals/week (v4: 0.58). Both v5.1 and v5.2 have a
+//   switch in the inputs; off = v4 behaviour.
 indicator("MWM LSD Model (Mangoe)", "LSD Model", overlay = true,
      max_boxes_count = 250, max_lines_count = 500, max_labels_count = 500)
 
 // ---------------- Inputs ----------------
 grpZone = "Zone detection"
 maxImpulseBars = input.int(4, "Impulse: max candles to reach size", minval = 1, maxval = 10, group = grpZone,
-     tooltip = "Zone = last opposite candle before a move that reaches the ATR multiple below within this many candles. Any candle count qualifies (his examples show 1-3 dominant candles). A candle touching the zone during the move invalidates it.")
+     tooltip = "Zone = last opposite candle before a move that reaches the ATR multiple below within this many candles. Any candle count qualifies (his examples show 1-3 dominant candles). An opposite-colour candle touching the zone during the move invalidates it (see 'Tap by colour').")
 impulseAtrMul  = input.float(1.5, "Impulse: min size (x ATR14 before the move)", minval = 0.0, step = 0.25, group = grpZone,
      tooltip = "MWM calibration of his 'large move'. Not a Mangoe number.")
+tapByColour    = input.bool(true, "Tap by colour: only an opposite-colour candle taps a zone", group = grpZone,
+     tooltip = "RD_Forex: 'No bullish candles can have come back to a supply zone. No bearish candles can have come back to a demand zone.' Mangoe: 'As soon as another bearish candle touches our demand zone, that means it is a tapped zone.' Applies while the zone forms and before the break of structure. Off = v4: any candle touching the zone kills it.")
 accuracyZones  = input.bool(false, "Accuracy zones", group = grpZone,
      tooltip = "Trim the far wick when the base candle out-ranges the next candle. Mangoe: forex only. On futures: 'we don't use accuracy zones, quite confirmed'.")
 maxStructHours = input.float(9.0, "Max structure age (hours)", minval = 1.0, maxval = 48.0, step = 0.5, group = grpZone,
@@ -50,8 +64,10 @@ liqHalfMax    = input.float(0.6, "50% rule: max fraction from the zone", minval 
      tooltip = "His fib says 50%; playbook rule 3 adds 'a bit further is fine'. 0.60 is MWM's reading of that.")
 maxSweepToTap = input.int(6, "Max bars from liquidity sweep to zone tap", minval = 0, maxval = 30, group = grpLiq,
      tooltip = "Mangoe: 'take our liquidity, tap the zone at the same time'; a retrace between the two 'isn't nice'. 0 = same candle only. 6 (30 min) is MWM's number; MNQ test 04-08/2026: 3 vs 12 changed no signals.")
-maxApproach   = input.int(1, "Max retracement swings between BOS and tap", minval = 0, maxval = 6, group = grpLiq,
-     tooltip = "Mangoe: price should come to the zone 'in a straight line'; 'only one small retracement' was fine; an approach with its own market structure usually gets only a small reaction. Counts confirmed 1-bar swings against the approach after the last break of structure, restarting whenever the structure makes a new extreme (final leg only). Zones over the cap die with reason 'approach'.")
+maxApproach   = input.int(2, "Max retracement swings between BOS and tap", minval = 0, maxval = 6, group = grpLiq,
+     tooltip = "Mangoe: price should come to the zone 'in a straight line'; 'only one small retracement' was fine; an approach with its own market structure usually gets only a small reaction. Counts confirmed 1-bar swings against the approach after the last break of structure, restarting whenever the structure makes a new extreme (final leg only). 2 because his 'one small retracement' on NQ 23 Jul prints two 1-bar swings (MWM calibration). Zones over the cap die with reason 'approach'.")
+swingIsRetrace = input.bool(true, "Swing after the break = retracement, not new liquidity", group = grpLiq,
+     tooltip = "After the break of structure, a new swing on the way back to the zone counts as a retracement (cap above). It becomes the liquidity only if price breaks structure again, which is his staircase. Off = v4: that swing becomes new liquidity at once and needs its own break, so a tap before that break kills the zone as 'touch'.")
 maxBosLegs    = input.int(2, "Max break-of-structure legs per zone", minval = 1, maxval = 6, group = grpLiq,
      tooltip = "Mangoe on his first loss: several liquidity levels and several breaks of structure = 'much larger structure, not what our setups look like, I generally avoid trades like that'. Two liquidity levels with one break (his NQ win) is fine. Zones over the cap die with reason 'complex'.")
 
@@ -90,7 +106,7 @@ colLiq  = input.color(color.new(color.black, 0),  "Liquidity level", group = grp
 showZoneText = input.bool(true, "Write 'Demand Zone' / 'Supply Zone' in the box", group = grpUi)
 showLiq = input.bool(true, "Show liquidity levels", group = grpUi)
 showKilled     = input.bool(true, "Keep invalidated zones (faded)", group = grpUi,
-     tooltip = "Every zone the model marked stays on the chart, faded, from birth to the bar that invalidated it (his 'that's invalid' zones). Off = delete them. About 50 zones/week on MNQ 5m, 8 in 10 die from a touch before break of structure.")
+     tooltip = "Every zone the model marked stays on the chart, faded, from birth to the bar that invalidated it (his 'that's invalid' zones). Off = delete them. About 120-140 zones/week on MNQ 5m (v5), 7 in 10 die from a touch before break of structure.")
 showKillReason = input.bool(false, "Label why a zone died", group = grpUi,
      tooltip = "touch = hit before BOS; through/inside = wick past the zone or body close inside; 50% = liquidity too far; linger = swept but not tapped in time; trend = structure against the zone at BOS; approach = too many retracements on the way in; complex = too many BOS legs; age.")
 
@@ -120,6 +136,8 @@ type Zone
     int   bosLegs   = 0     // break-of-structure legs completed
     int   bosBar    = -1    // bar of the last break of structure
     int   approach  = 0     // retracement swings since the last BOS
+    float pending           // v5.2: swing formed after the BOS; becomes liquidity only on a new BOS
+    int   pendBar   = -1
     float tapVol            // tap-bar volume / 20-bar average
     float entryPx
     float sl
@@ -202,7 +220,7 @@ if close > open
                 clean = true
                 if k >= 2
                     for j = 0 to k - 2
-                        if low[j] <= zTop
+                        if low[j] <= zTop and (not tapByColour or close[j] <= open[j])
                             clean := false
                 if clean and (close - open[k - 1]) >= impulseAtrMul * atr[k]
                     demBases.push(base)
@@ -227,7 +245,7 @@ if close < open
                 clean = true
                 if k >= 2
                     for j = 0 to k - 2
-                        if high[j] >= zBot
+                        if high[j] >= zBot and (not tapByColour or close[j] >= open[j])
                             clean := false
                 if clean and (open[k - 1] - close) >= impulseAtrMul * atr[k]
                     supBases.push(base)
@@ -280,16 +298,21 @@ if zones.size() > 0
             else if z.dir == 1
                 // ================= DEMAND =================
                 if z.state <= 2
-                    if z.state < 2 and low <= z.top
-                        kill := true    // touched before BOS: liquidity leg / opposing candle hit the zone
+                    if z.state < 2 and low <= z.top and (not tapByColour or close <= open)
+                        kill := true    // touched before BOS: an opposing (bearish) candle hit the zone
                         kr := "touch"
                     else if z.state == 2 and (low < z.bot or (close < z.top and close > z.bot))
                         kill := true    // wick through the zone, or body close inside (edge close is fine)
                         kr := low < z.bot ? "through" : "inside"
                     else
-                        // new swing low in front of the zone (before any sweep) = liquidity; each one needs its own BOS
+                        // new swing low in front of the zone (before any sweep): before BOS it replaces the liquidity; after BOS (v5.2)
+                        // it is a retracement on the approach and becomes the liquidity only when price breaks structure again
                         newLiq = not z.swept and not na(pl) and pl > z.top and downLeg >= liqMinLeg
-                        if newLiq
+                        liqReset = newLiq and not (swingIsRetrace and z.state == 2)
+                        if newLiq and not liqReset
+                            z.pending := pl                 // v5.2: a retracement for now (counted below)
+                            z.pendBar := bar_index - 1
+                        if liqReset
                             z.liqLevel := pl
                             z.liqBar   := bar_index - 1
                             z.bosLevel := z.structExt     // highest high BEFORE this bar (same-bar BOS possible)
@@ -301,6 +324,27 @@ if zones.size() > 0
                                 if not na(z.liqLbl)
                                     z.liqLbl.delete()
                                 z.liqLbl := label.new(z.liqBar, z.liqLevel, "Liquidity", yloc = yloc.price, style = label.style_none, textcolor = colLiq, size = size.small)
+                        if swingIsRetrace and z.state == 2 and not na(z.pending) and close > z.structExt
+                            // v5.2 staircase: price broke structure again, so the pending swing low is now the liquidity
+                            z.liqLevel := z.pending
+                            z.liqBar   := z.pendBar
+                            z.pending  := na
+                            z.bosLegs  := z.bosLegs + 1
+                            z.bosBar   := bar_index
+                            z.approach := 0
+                            if showLiq
+                                if not na(z.liqLn)
+                                    z.liqLn.delete()
+                                z.liqLn := line.new(z.liqBar, z.liqLevel, bar_index, z.liqLevel, color = colLiq, style = line.style_solid, width = 1)
+                                if not na(z.liqLbl)
+                                    z.liqLbl.delete()
+                                z.liqLbl := label.new(z.liqBar, z.liqLevel, "Liquidity", yloc = yloc.price, style = label.style_none, textcolor = colLiq, size = size.small)
+                            if trendFilter and trend != 1
+                                kill := true
+                                kr := "trend"
+                            else if z.bosLegs > maxBosLegs
+                                kill := true
+                                kr := "complex"
                         if z.state == 1 and close > z.bosLevel
                             z.state   := 2
                             z.bosLegs  := z.bosLegs + 1
@@ -312,7 +356,7 @@ if zones.size() > 0
                             else if z.bosLegs > maxBosLegs
                                 kill := true    // staircase of liquidity + BOS legs: 'much larger structure'
                                 kr := "complex"
-                        if not kill and z.state == 2 and not newLiq
+                        if not kill and z.state == 2 and not liqReset
                             if not na(pl) and pl > z.top and bar_index - 1 > z.bosBar
                                 z.approach := z.approach + 1   // a bounce on the way down: market structure against a straight-line approach
                             if not z.swept and low < z.liqLevel
@@ -408,7 +452,7 @@ if zones.size() > 0
             else
                 // ================= SUPPLY =================
                 if z.state <= 2
-                    if z.state < 2 and high >= z.bot
+                    if z.state < 2 and high >= z.bot and (not tapByColour or close >= open)
                         kill := true
                         kr := "touch"
                     else if z.state == 2 and (high > z.top or (close < z.top and close > z.bot))
@@ -416,7 +460,11 @@ if zones.size() > 0
                         kr := high > z.top ? "through" : "inside"
                     else
                         newLiq = not z.swept and not na(ph) and ph < z.bot and upLeg >= liqMinLeg
-                        if newLiq
+                        liqReset = newLiq and not (swingIsRetrace and z.state == 2)
+                        if newLiq and not liqReset
+                            z.pending := ph
+                            z.pendBar := bar_index - 1
+                        if liqReset
                             z.liqLevel := ph
                             z.liqBar   := bar_index - 1
                             z.bosLevel := z.structExt     // lowest low BEFORE this bar
@@ -428,6 +476,26 @@ if zones.size() > 0
                                 if not na(z.liqLbl)
                                     z.liqLbl.delete()
                                 z.liqLbl := label.new(z.liqBar, z.liqLevel, "Liquidity", yloc = yloc.price, style = label.style_none, textcolor = colLiq, size = size.small)
+                        if swingIsRetrace and z.state == 2 and not na(z.pending) and close < z.structExt
+                            z.liqLevel := z.pending
+                            z.liqBar   := z.pendBar
+                            z.pending  := na
+                            z.bosLegs  := z.bosLegs + 1
+                            z.bosBar   := bar_index
+                            z.approach := 0
+                            if showLiq
+                                if not na(z.liqLn)
+                                    z.liqLn.delete()
+                                z.liqLn := line.new(z.liqBar, z.liqLevel, bar_index, z.liqLevel, color = colLiq, style = line.style_solid, width = 1)
+                                if not na(z.liqLbl)
+                                    z.liqLbl.delete()
+                                z.liqLbl := label.new(z.liqBar, z.liqLevel, "Liquidity", yloc = yloc.price, style = label.style_none, textcolor = colLiq, size = size.small)
+                            if trendFilter and trend != -1
+                                kill := true
+                                kr := "trend"
+                            else if z.bosLegs > maxBosLegs
+                                kill := true
+                                kr := "complex"
                         if z.state == 1 and close < z.bosLevel
                             z.state   := 2
                             z.bosLegs  := z.bosLegs + 1
@@ -439,7 +507,7 @@ if zones.size() > 0
                             else if z.bosLegs > maxBosLegs
                                 kill := true
                                 kr := "complex"
-                        if not kill and z.state == 2 and not newLiq
+                        if not kill and z.state == 2 and not liqReset
                             if not na(ph) and ph < z.bot and bar_index - 1 > z.bosBar
                                 z.approach := z.approach + 1   // a dip on the way up
                             if not z.swept and high > z.liqLevel

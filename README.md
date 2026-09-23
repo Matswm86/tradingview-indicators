@@ -6,11 +6,10 @@ Pine Script v6 indicators for intraday futures, built and tested on MNQ (Micro E
 |---|---|---|
 | EMA x VWAP Engulfing | `EMA_VWAP_Engulfing.pine` | Fast EMA against session VWAP, five setups, a twelve-point confluence score |
 | LiqSweep+iFVG | `LiqSweep_iFVG.pine` | Session-liquidity raid into inverted-FVG reversal |
-| LiqSweep+iFVG Pro | `LiqSweep_iFVG_Pro.pine` | Same core plus order-flow and auction confluences |
-| LiqSweep+iFVG Pro +VWAP/Fib | `LiqSweep_iFVG_Pro_VWAP_Fib.pine` | Pro plus anchored VWAP and fib-retracement confluence |
-| LiqSweep CVD | `LiqSweep_CVD.pine` | Cumulative volume delta companion pane |
+| LiqSweep+iFVG Pro +VWAP | `LiqSweep_iFVG_Pro_VWAP.pine` | Same core plus order-flow, auction and anchored-VWAP confluences |
 | Liquidity Map | `Liquidity_Map.pine` | Engineered liquidity, respected levels and live liquidity blocks |
 | LSD Model | `LSD_Model.pine` | Supply/demand zone + liquidity sweep + directional-close entry |
+| Po3 4H | `Po3_4H.pine` | The 10:00 New York 4H candle read on the 1m chart as accumulation, manipulation, distribution |
 | Trend Hub | `Trend_Hub.pine` | Qualified-trend and momentum read across three timeframes |
 | Session Pulse | `Session_Pulse.pine` | Live session volume pace and how much of a normal day's range is spent |
 
@@ -58,22 +57,24 @@ Session-liquidity raid into inverted-FVG reversal.
 - Optional modules: equal highs/lows tracking (EQH/EQL) with optional raid-arming, a higher-timeframe FVG confluence filter (5m / 15m / 1h / 4h / daily) with optional gap overlay, session boxes, raid labels, premium/discount dealing-range zones, and Williams-fractal swing-point marks.
 - Signal timing validated on 60 days of real MNQ 1-minute data: the entry triangle prints on the inversion bar (enter next bar).
 
-## Pro version
+## Pro +VWAP version
 
-[`LiqSweep_iFVG_Pro.pine`](LiqSweep_iFVG_Pro.pine) is the same core with order-flow and auction confluences layered on. Everything is toggleable, and a single "Chart density" control (Minimal / Balanced / Full) strips the chart back without touching the individual switches.
+[`LiqSweep_iFVG_Pro_VWAP.pine`](LiqSweep_iFVG_Pro_VWAP.pine) is the same core with order-flow, auction and anchored-VWAP confluences layered on. Everything is toggleable, and a single "Chart density" control (Minimal / Balanced / Full) strips the chart back without touching the individual switches.
 
 ![LiqSweep+iFVG Pro on MNQ 5m](assets/liqsweep-ifvg-pro-mnq-5m.png)
 
 - **Volume profile** built from `request.footprint()`: point of control and value-area edges, over a rolling window, per day, or over one fixed clock window (18:00-08:55 New York by default, the overnight auction) whose edges freeze and carry into the session.
 - **Value-area reclaim** markers: price closes beyond a frozen value-area edge and then closes back through it, the failed-auction read.
-- **Cumulative volume delta** drawn as a rescaled strip inside the price pane, with divergence marked at confirmed swings. [`LiqSweep_CVD.pine`](LiqSweep_CVD.pine) draws the same thing in its own lower pane, since one Pine script only gets one pane.
+- **Cumulative volume delta** drawn as a rescaled strip inside the price pane, with divergence marked at confirmed swings.
 - **SMT divergence** against a correlated market, evaluated only where a tracked level is swept, comparing that market's own extreme over the same session.
 - **Sequencing rule**: optionally require an external pool (a session high or low) to be swept before a sweep of an equal high or low is allowed to arm anything.
+- **Anchored VWAP** from a chosen anchor, with optional standard-deviation bands.
+- **Trade levels** drawn on each signal: entry at the next bar's open, stop behind the swing the sweep ran, target at 1R by default. Display only.
 - **Alerts** for long, short, any entry, level swept, and value-area reclaim, so the markers can be switched off entirely.
 
 The footprint modules need a TradingView plan that includes volume-footprint data, and a symbol with real trade data rather than a CFD proxy. Where footprint data is unavailable those modules draw nothing and the rest of the indicator is unaffected.
 
-[`LiqSweep_iFVG_Pro_VWAP_Fib.pine`](LiqSweep_iFVG_Pro_VWAP_Fib.pine) is the Pro build with anchored-VWAP and fib-retracement confluence added on top. It is the largest file here and the slowest to load; run it on one chart, not four.
+It is the largest file here and the slowest to load; run it on one chart, not four.
 
 ## Liquidity Map
 
@@ -85,9 +86,17 @@ course, rather than inventing a new one.
 - **Equal highs and lows** inside a relative-equal band, with the touch count in the label.
 - **Engineered levels**: a respected level sitting short of an intact higher-timeframe reference,
   which is where stops get built rather than where price is going.
-- **Liquidity blocks** as live, validated, promotable objects: an anchor for the entry and the
-  stop that dies only when its target pool is taken or price closes through it, and that gets
+- **Liquidity blocks** as live, validated, promotable objects. A block is born only from a spike
+  that closes back inside the level (a grab); a close beyond that does not come back within a few
+  bars is a run and makes no block. It starts pending and arms when the leg after the sweep prints
+  an internal swing (traders were induced) and then breaks the structure it came from. A straight
+  run to the break marks it invalid, and no break in time marks it low probability.
+- **Block targets and life**: an armed block targets the nearest unrun pool beyond the break
+  (respected levels, structure highs and lows, the prior day's high and low, finished session
+  highs and lows, the higher-timeframe pivot) and shows its reward-to-risk. It is the anchor for
+  the entry and the stop, dies only when that pool is taken or price closes through it, and gets
   promoted when a new high respects it and traps early sellers.
+- **Status table** with the live counts and a flag on days that are shaping up as an inside day.
 - **Focus mode**, on by default, shows engineered liquidity, its draw and respected levels, and
   puts everything else behind a toggle.
 
@@ -98,11 +107,37 @@ course, rather than inventing a new one.
 ![LSD Model on MNQ 5m](assets/lsd-model-mnq-5m.png)
 
 - **Zone**: the final opposite-direction candle before an impulsive move (N straight candles, displacement ≥ k×ATR), extended to the next candle's near wick. Optional "accuracy zone" trimming for forex (off by default; the model's author reports it works worse on futures).
-- **Liquidity**: a 2+ candle swing must form in front of the zone without touching it, in the zone-side half of the setup (fib 50% rule), then structure must break in the setup's direction.
+- **Tapped zones**: a zone counts as used only when an opposite-colour candle touches it (a bearish candle into a demand zone, a bullish one into a supply zone) before structure breaks. A same-colour candle touching it does not kill it.
+- **Liquidity**: a 2+ candle swing must form in front of the zone without touching it, in the zone-side half of the setup (fib 50% rule), then structure must break in the setup's direction. A new swing that forms after the break, on the way back to the zone, is a retracement rather than new liquidity; it becomes the liquidity only if structure breaks again. The final leg into the zone may carry at most two retracement swings (the "straight line").
 - **Entry signal**: price sweeps the liquidity, wicks into the zone without a body close inside it, and the first directional close prints the triangle. Stop line at the deepest wick into the zone, targets at 1:3 and 1:4.
 - **Structure age**: a zone expires nine hours after its base candle, measured from the base rather than from the detection bar.
 - **Grading**: each signal carries an A, B or C grade from tap depth, tap volume, approach shape and higher-timeframe agreement.
 - **Session filter** and four alerts: long signal, short signal, zone tapped, liquidity swept.
+
+## Po3 4H
+
+[`Po3_4H.pine`](Po3_4H.pine) is a mechanical reading of Jacktrades' "10 a.m. PO3" model, built from
+his public videos and PO3 Bootcamp series. The model trades one candle, the 4-hour candle that
+opens at 10:00 New York (optionally 14:00), and reads it on the 1-minute chart as a Power of Three.
+
+- **Accumulation**: a box around the 4H open, joined by the pre-open bars when they were sideways.
+- **Manipulation**: price takes one side of the box and taps the nearest 15m (else 5m) fair value
+  gap, which prints the 4H candle's wick. The gap's timeframe grades the setup: 15m or 1H = A,
+  5m = B, 1m = C.
+- **Entry**: order-flow confirmation, a 1m gap against the trade inverted (or a change in state of
+  delivery), then a new 1m gap respected. Stop at the manipulation extreme, target at the box's
+  other edge when that is at least 1R away, else 1R with a break-even mark.
+- **Days and setups it stands aside from**: the trading day before CPI or FOMC, FOMC day, optional
+  Mondays and your own dates; a manipulation too deep without a gap, the far side of the box taken
+  first, a close through the nearest 15m/1H gap, and 10:00 entries held until 11:00 after a big
+  opening hour. Each blocked entry gets a grey x with the reason on hover.
+- **Bias filter**: the previous 4H candle's direction, overruled by a swept and reclaimed
+  previous-day extreme. Off runs both directions.
+- **SMT**: an entry label carries "SMT" when ES held its box edge while this chart broke it.
+
+Use a 1m to 5m chart. The stats table counts touches on chart bars with no fees or slippage: it
+shows whether the indicator marks what he marks, not whether the model makes money. No edge claim
+is attached.
 
 ## Trend Hub
 
