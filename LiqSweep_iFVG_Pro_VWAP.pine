@@ -1,5 +1,8 @@
 //@version=6
-indicator("LiqSweep+iFVG Pro", "LiqSweep+iFVG Pro", true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+indicator("LiqSweep+iFVG Pro +VWAP", "LiqSweep+iFVG Pro+V", true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// Group 14 (anchored VWAP with standard-deviation bands) is a research
+// add-on on top of the LiqSweep+iFVG Pro core.
 
 // ===================================================================
 // LiqSweep+iFVG Pro - session-liquidity sweep into inverted-FVG
@@ -36,9 +39,7 @@ indicator("LiqSweep+iFVG Pro", "LiqSweep+iFVG Pro", true, max_lines_count=500, m
 // - Value-area reclaim markers: a close beyond a frozen edge that is
 //   then closed back through, the failed-auction read.
 // - Group 12 cumulative volume delta, rescaled into a band inside
-//   the price pane, with divergence marked at confirmed swings. The
-//   companion LiqSweep_CVD.pine draws the same in its own pane,
-//   since one Pine script only ever gets one pane.
+//   the price pane, with divergence marked at confirmed swings.
 //
 // CONTEXT
 // - Group 11 SMT divergence against a correlated market, evaluated
@@ -61,6 +62,10 @@ indicator("LiqSweep+iFVG Pro", "LiqSweep+iFVG Pro", true, max_lines_count=500, m
 // - Pool tiers: equal highs/lows now arm by default and sweep
 //   markers carry his tier letter (S/A equal, B relative equal and
 //   session). Source: his printed tier list, IkTXIUDag4w 30:40.
+//
+// Group 16 draws the trade each signal implies: entry at the next
+// bar's open, stop behind the swing the sweep ran, target at 1R by
+// default, the way the VLS indicator draws them. Display only.
 //
 // Alerts exist for long, short, any entry, level swept and
 // value-area reclaim, so the markers can be switched off entirely.
@@ -205,6 +210,29 @@ colAS = input.color(#BA68C8, "Asia", inline="c", group=grpC)
 colBull = input.color(#26A69A, "Bull FVG", inline="c2", group=grpC, tooltip="Fill colors for live gap boxes and the inverted-gap highlight.")
 colBear = input.color(#EF5350, "Bear FVG", inline="c2", group=grpC)
 
+grpVW = "14. VWAP"
+vwapOn = input.bool(true, "Show VWAP", group=grpVW, tooltip="Volume-weighted average price from the chosen anchor, with optional standard-deviation bands. Auction context for judging a signal's location - a sweep-reversal long far above VWAP is chasing; one into VWAP from below is entering at value.\n\nDisplay and export only: VWAP never gates or arms a signal. ON by default so the value area is always on the chart; every VWAP-as-filter idea still goes through the engine test bench first, same as the killed delta-divergence filter.")
+vwapAnchor = input.string("Day", "Anchor / reset", options=["Day", "Week", "NY session", "London session", "Asia session"], group=grpVW, tooltip="Where the running average restarts. Day is the classic session VWAP. The session choices reset at that session's open (windows from group 01) and keep accumulating until the next open, so the level stays on screen between sessions.")
+vwapBand1 = input.bool(true,  "Band 1", inline="vb1", group=grpVW)
+vwapMult1 = input.float(1.0,  "x stdev", minval=0.1, step=0.5, inline="vb1", group=grpVW)
+vwapBand2 = input.bool(true,  "Band 2", inline="vb2", group=grpVW)
+vwapMult2 = input.float(2.0,  "x stdev", minval=0.1, step=0.5, inline="vb2", group=grpVW)
+colVwap   = input.color(#FFD54F, "VWAP", inline="vwc", group=grpVW)
+colVwBand = input.color(#90A4AE, "Bands", inline="vwc", group=grpVW)
+
+grpT = "16. Trade levels (entry / stop / target)"
+tlOn = input.bool(true, "Draw entry / stop / target on each signal", group=grpT, tooltip="A signal marker says a setup fired; it does not say what the trade is. With this on, every LONG/SHORT signal also draws the three prices that define it: the entry, a stop behind the swing the sweep ran, and a target a fixed multiple of that risk away.\n\nDisplay only. Nothing in this group gates, arms or cancels a signal, so the triangles, the alerts and the sample-size counters read exactly the same with it off.")
+tlEntry = input.string("Next bar open", "Entry price", options=["Next bar open", "Signal bar close"], group=grpT, tooltip="Next bar open: the fill a market order sent on the signal would actually get, which is what the entry triangle above means by 'enter next bar'. The levels appear one bar after the signal, because the open they are measured from does not exist until then.\n\nSignal bar close: draws immediately on the signal bar at its close. Faster to read while a bar is live, but it prices a fill nobody got.")
+tlSlSrc = input.string("Recent swing point", "Stop anchor", options=["Recent swing point", "Signal bar wick"], group=grpT, tooltip="Recent swing point: the last confirmed fractal swing on the stop side, extended to the extreme printed since it. While price holds above that swing the stop sits on the swing itself; once the sweep trades through it the stop follows the sweep wick, so a stop is never left inside the candle that triggered the entry. The target label says which of the two the stop landed on.\n\nSignal bar wick: the trigger candle's own low (long) or high (short), the tighter and more aggressive stop.")
+tlPivN = input.int(5, "Swing strength for the stop (bars each side)", minval=1, maxval=50, group=grpT, tooltip="Pivot strength used to find the stop's swing. Independent of group 06's swing marks, which are display-only and default to 10: a stop wants the nearer structure, a chart mark wants the bigger one. Raise it for stops further back and fewer, wider setups.")
+tlBuf = input.int(2, "Stop buffer (ticks beyond the swing)", minval=0, group=grpT, tooltip="Ticks added beyond the swing so the stop sits behind the wick rather than exactly on it. 2 ticks is 0.5 points on MNQ.")
+tlRR = input.float(1.0, "Target at N x risk (R)", minval=0.25, step=0.25, group=grpT, tooltip="Distance to the target as a multiple of the stop distance. 1.0 puts the target exactly one R away, the same distance as the stop.")
+tlMaxPts = input.float(0.0, "Skip setups with risk wider than (points, 0 = off)", minval=0.0, step=5.0, group=grpT, tooltip="A swing stop can land 100+ points away after a wide sweep, which is not a trade a Combine account can take. Above 0, a setup whose stop is further than this draws no levels at all.\n\nThe signal itself still fires: the triangle, the alert and the counters are untouched, so this filter never silently changes what the indicator reports.")
+tlBars = input.int(24, "Level length (bars)", minval=3, maxval=200, group=grpT, tooltip="How far forward the three lines and their zones extend from the signal bar.")
+tlKeep = input.int(6, "Keep the last N setups on the chart", minval=1, maxval=40, group=grpT, tooltip="Older setups are deleted once this many newer ones exist. TradingView caps a script at 500 lines, 500 boxes and 500 labels total, shared with the level lines, gap boxes and sweep markers, so an uncapped trade history would starve them on a long chart.")
+tlZones_i = input.bool(true, "Shade the risk and reward zones", group=grpT, tooltip="Fills entry-to-stop in the bear colour and entry-to-target in the bull colour, the way the VLS indicator draws them. Off leaves the three lines alone. Chart density Minimal drops the shading and keeps the lines.")
+tlLabel = input.bool(true, "Price label at the target", group=grpT, tooltip="One line at the end of the levels carrying direction, entry, stop, target, the R multiple and the risk in points, plus whether the stop sat on the swing or on the sweep wick.")
+
 // ── Density-adjusted toggles ────────────────────────────────────────
 // Each drawing switch below is its own input ANDed with the density
 // choice, so lowering the density can hide an element but never reveal
@@ -215,6 +243,7 @@ bool usePD      = usePD_i      and not dMin
 bool useSwings  = useSwings_i  and not dMin
 bool htfFvgShow = htfFvgShow_i and not dMin
 bool showStatus = showStatus_i and not dMin
+bool tlZones    = tlZones_i    and not dMin
 
 
 tzNY = "America/New_York"
@@ -1035,6 +1064,164 @@ plotshape(sigShort, "Signal short (enter next bar)", shape.triangledown, locatio
 plotshape(sigLong, "Signal long (enter next bar)", shape.triangleup, location.belowbar, color.green, size=size.small, display=display.pane)
 bgcolor(armDir.size() > 0 ? color.new(color.yellow, 92) : na, title="Armed (level swept, waiting for trigger)")
 
+// ── Trade levels: entry / stop / target (group 16) ───────────────────
+// The trade each signal implies, drawn the way the VLS indicator draws
+// it: entry, a stop behind the swing the sweep ran, and a target tlRR
+// times that risk away. Display only - no branch below writes sigLong,
+// sigShort or any counter, so a setup the risk filter skips still fires
+// its triangle and its alert.
+//
+// The stop anchor. A fractal confirms tlPivN bars AFTER its swing bar,
+// so the last confirmed swing on its own can sit above the wick that
+// triggered the entry. The running extreme fixes that: it restarts at
+// each confirmed swing and then tracks the lowest low (highest high)
+// printed since, so it IS the swing until price trades through it and
+// the sweep wick once it does.
+
+float tlPvLo = ta.pivotlow(tlPivN, tlPivN)
+float tlPvHi = ta.pivothigh(tlPivN, tlPivN)
+var float tlSwLo  = na   // last confirmed swing low  (the structural stop)
+var float tlSwHi  = na
+var float tlRunLo = na   // lowest low printed since that swing confirmed
+var float tlRunHi = na
+if not na(tlPvLo)
+    tlSwLo  := tlPvLo
+    tlRunLo := tlPvLo
+if not na(tlPvHi)
+    tlSwHi  := tlPvHi
+    tlRunHi := tlPvHi
+tlRunLo := na(tlRunLo) ? low  : math.min(tlRunLo, low)
+tlRunHi := na(tlRunHi) ? high : math.max(tlRunHi, high)
+
+var array<line>  tlLn = array.new<line>()
+var array<label> tlLb = array.new<label>()
+var array<box>   tlBx = array.new<box>()
+
+// oldest setups go first: the 500-drawing cap is shared with the level
+// lines, gap boxes and sweep markers, which must not be starved.
+f_tlCull() =>
+    while tlLn.size() > tlKeep * 3
+        line.delete(tlLn.shift())
+    while tlBx.size() > tlKeep * 2
+        box.delete(tlBx.shift())
+    while tlLb.size() > tlKeep
+        label.delete(tlLb.shift())
+    true
+
+// a setup is drawable when the stop is a real distance away and, when
+// the risk cap is on, inside it
+f_tlOk(float entry, float sl) =>
+    float r = math.abs(entry - sl)
+    r > tick / 2 and (tlMaxPts <= 0 or r <= tlMaxPts)
+
+// returns the target price so the caller can export it
+f_tlDraw(int d, float entry, float sl, int x0, bool atSwing) =>
+    float risk = math.abs(entry - sl)
+    float tp   = d == 1 ? entry + tlRR * risk : entry - tlRR * risk
+    int   x1   = x0 + tlBars
+    if tlZones
+        tlBx.push(box.new(x0, math.max(entry, sl), x1, math.min(entry, sl),
+             border_color=color.new(colBear, 60), bgcolor=color.new(colBear, 88)))
+        tlBx.push(box.new(x0, math.max(entry, tp), x1, math.min(entry, tp),
+             border_color=color.new(colBull, 60), bgcolor=color.new(colBull, 88)))
+    tlLn.push(line.new(x0, entry, x1, entry, color=color.new(color.gray, 15), style=line.style_dotted))
+    tlLn.push(line.new(x0, sl,    x1, sl,    color=color.new(colBear, 0),     style=line.style_solid))
+    tlLn.push(line.new(x0, tp,    x1, tp,    color=color.new(colBull, 0),     style=line.style_solid))
+    if tlLabel
+        color tlCol = d == 1 ? colBull : colBear
+        string tlTxt = (d == 1 ? "LONG" : "SHORT")
+             + "  E " + str.tostring(entry, format.mintick)
+             + "   SL " + str.tostring(sl, format.mintick) + (atSwing ? " (swing)" : " (wick)")
+             + "   TP " + str.tostring(tp, format.mintick) + "  " + str.tostring(tlRR, "#.##") + "R"
+             + "   risk " + str.tostring(risk, format.mintick)
+        tlLb.push(label.new(x1, tp, tlTxt, style=label.style_label_left,
+             color=color.new(tlCol, 78), textcolor=color.new(tlCol, 0), size=labSz))
+    f_tlCull()
+    tp
+
+// pending setup, held from the signal bar to the bar whose open fills it
+var int   tlPBar = na
+var float tlPLSl = na    // pending long stop  (na = no pending long)
+var float tlPSSl = na    // pending short stop
+var bool  tlPLSw = false // that stop sat on the swing, not the sweep wick
+var bool  tlPSSw = false
+
+// one row per drawn setup, for the CSV test bench
+float tlXEntry = na
+float tlXStop  = na
+float tlXTgt   = na
+float tlXRisk  = na
+float tlXDir   = na
+
+bool  tlNext = tlEntry == "Next bar open"
+float tlBufP = tlBuf * tick
+
+// Drawing the pending setup runs BEFORE capturing a new one: a signal on
+// the very next bar would otherwise overwrite the pending slot and the
+// first setup would never be drawn.
+if tlOn and tlNext and not na(tlPBar) and bar_index == tlPBar + 1
+    if not na(tlPLSl)
+        float eL = open
+        float sL = math.min(tlPLSl, eL - tick)   // a long stop must sit below the fill
+        if f_tlOk(eL, sL)
+            tlXTgt   := f_tlDraw(1, eL, sL, tlPBar, tlPLSw)
+            tlXEntry := eL
+            tlXStop  := sL
+            tlXRisk  := eL - sL
+            tlXDir   := 1.0
+    if not na(tlPSSl)
+        float eS = open
+        float sS = math.max(tlPSSl, eS + tick)
+        if f_tlOk(eS, sS)
+            tlXTgt   := f_tlDraw(-1, eS, sS, tlPBar, tlPSSw)
+            tlXEntry := eS
+            tlXStop  := sS
+            tlXRisk  := sS - eS
+            tlXDir   := -1.0
+    tlPBar := na
+    tlPLSl := na
+    tlPSSl := na
+
+if tlOn and (sigLong or sigShort)
+    float tlSlL = (tlSlSrc == "Signal bar wick" ? low  : nz(tlRunLo, low))  - tlBufP
+    float tlSlS = (tlSlSrc == "Signal bar wick" ? high : nz(tlRunHi, high)) + tlBufP
+    // still resting on the swing itself, or already pushed down to the wick
+    bool tlSwgL = tlSlSrc != "Signal bar wick" and not na(tlSwLo) and tlRunLo >= tlSwLo - tick / 2
+    bool tlSwgS = tlSlSrc != "Signal bar wick" and not na(tlSwHi) and tlRunHi <= tlSwHi + tick / 2
+    if tlNext
+        tlPBar := bar_index
+        tlPLSl := sigLong  ? tlSlL : na
+        tlPSSl := sigShort ? tlSlS : na
+        tlPLSw := tlSwgL
+        tlPSSw := tlSwgS
+    else
+        if sigLong
+            float cL = close
+            float kL = math.min(tlSlL, cL - tick)
+            if f_tlOk(cL, kL)
+                tlXTgt   := f_tlDraw(1, cL, kL, bar_index, tlSwgL)
+                tlXEntry := cL
+                tlXStop  := kL
+                tlXRisk  := cL - kL
+                tlXDir   := 1.0
+        if sigShort
+            float cS = close
+            float kS = math.max(tlSlS, cS + tick)
+            if f_tlOk(cS, kS)
+                tlXTgt   := f_tlDraw(-1, cS, kS, bar_index, tlSwgS)
+                tlXEntry := cS
+                tlXStop  := kS
+                tlXRisk  := kS - cS
+                tlXDir   := -1.0
+
+// Export. In "Next bar open" mode these print one bar AFTER the signal
+// triangle, because that is the bar the fill happens on.
+plot(tlXEntry, "Trade: entry",  display=display.data_window)
+plot(tlXStop,  "Trade: stop",   display=display.data_window)
+plot(tlXTgt,   "Trade: target", display=display.data_window)
+plot(tlXRisk,  "Trade: risk (points)", display=display.data_window)
+plot(tlXDir,   "Trade: direction (+1 long, -1 short)", display=display.data_window)
+
 // ── Macro dealing range: premium/discount (merged from the standalone
 // "Macro Dealing Range & Premium/Discount" indicator) ────────────────
 
@@ -1490,3 +1677,39 @@ plot(pdwOn ? pdH : na, "Prior day high",  display=display.data_window)
 plot(pdwOn ? pdL : na, "Prior day low",   display=display.data_window)
 plot(pwkOn ? pwH : na, "Prior week high", display=display.data_window)
 plot(pwkOn ? pwL : na, "Prior week low",  display=display.data_window)
+
+// ── VWAP (group 14) ─────────────────────────────────────────────────
+// Anchored volume-weighted average price with stdev bands, accumulated
+// manually so the anchor can be a day, a week, or one of group 01's
+// session opens. Display and export only: never feeds the arming logic.
+
+string vwSessStr = vwapAnchor == "NY session" ? nySess : vwapAnchor == "London session" ? loSess : asSess
+bool vwInSess  = not na(time(timeframe.period, vwSessStr, tzNY))
+bool vwSessOpen = vwInSess and not vwInSess[1]
+bool vwReset = vwapAnchor == "Day" ? newDayBar : vwapAnchor == "Week" ? newWeekBar : vwSessOpen
+
+var float vwSumPV  = 0.0
+var float vwSumV   = 0.0
+var float vwSumPV2 = 0.0
+if vwReset
+    vwSumPV  := 0.0
+    vwSumV   := 0.0
+    vwSumPV2 := 0.0
+float vwSrc = hlc3
+float vwVol = nz(volume)
+if vwVol > 0
+    vwSumPV  += vwSrc * vwVol
+    vwSumV   += vwVol
+    vwSumPV2 += vwSrc * vwSrc * vwVol
+
+float vwapVal = vwSumV > 0 ? vwSumPV / vwSumV : na
+float vwVar   = vwSumV > 0 ? math.max(vwSumPV2 / vwSumV - vwapVal * vwapVal, 0.0) : na
+float vwSd    = math.sqrt(vwVar)
+
+plot(vwapOn ? vwapVal : na, "VWAP", color=color.new(colVwap, 0), linewidth=2, style=plot.style_linebr)
+plot(vwapOn and vwapBand1 ? vwapVal + vwapMult1 * vwSd : na, "VWAP +1 band", color=color.new(colVwBand, 40), style=plot.style_linebr)
+plot(vwapOn and vwapBand1 ? vwapVal - vwapMult1 * vwSd : na, "VWAP -1 band", color=color.new(colVwBand, 40), style=plot.style_linebr)
+plot(vwapOn and vwapBand2 ? vwapVal + vwapMult2 * vwSd : na, "VWAP +2 band", color=color.new(colVwBand, 60), style=plot.style_linebr)
+plot(vwapOn and vwapBand2 ? vwapVal - vwapMult2 * vwSd : na, "VWAP -2 band", color=color.new(colVwBand, 60), style=plot.style_linebr)
+// export: signed distance from VWAP in points, for the threshold test bench
+plot(vwapOn ? close - vwapVal : na, "VWAP: close minus vwap (points)", display=display.data_window)

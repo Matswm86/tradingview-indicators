@@ -1,4 +1,16 @@
 //@version=6
+// MWM Liquidity Map v1.4 (2026-09-22, compiled) — the LB engine re-read against the InterEquity coaching call -UtPvA5LuuU:
+//   1. A block is born only from a spike that closes back: a GRAB at once, a close beyond gets runConfirm bars to close back
+//      inside, else it was a run and no block ("price spiked it out and moved away", x-7H1E4ToC8).
+//   2. The induced-traders gate now tests the leg AFTER the sweep (55:42-56:09, drawn as a valid/invalid pair at 56:40). A block is
+//      born PENDING; it ARMS when the leg closes beyond the swing the sweep came from after printing an internal swing (the
+//      inducement), is INVALID when the leg breaks straight through with no internal swing, and is LOW PROBABILITY when no
+//      break comes within lbBosBars (61:40-62:00). v1.3 counted pivots BEFORE the sweep and so called both of his drawings invalid.
+//   3. A block's target is the nearest unrun pool beyond the structure break among respected levels, structure lows/highs
+//      (iGHqUTTvKro), prior-day high/low (-mX823uc5-s), finished session highs/lows (xaZeNPHwKDw) and the HTF pivot.
+//      v1.3 accepted respected levels only and called blocks "no pool to target" on days with plenty of pools.
+//   4. Armed blocks show reward-to-risk (entry at the swept level, stop at the wick), display only; an alert fires when price takes
+//      the inducement swing and holds the block (03:16-03:27). The status table flags an expected inside day (HEBP5I3z__c).
 // MWM Liquidity Map v1.3.2 (2026-09-19) — LB engine: the liquidity block becomes a LIVE, validated, promotable object per the
 // InterEquity coaching material (Marco Accettone).
 // Until v1.2 an LB was a dead grey level deleted after lbKeepBars. The presenter uses it as the entry anchor and the stop
@@ -23,8 +35,9 @@
 //   EQH / EQL  2+ pivots inside the relative-equal band [MM][RT]; touch count in the label
 //   ENG  engineered level [C]: a respected level sitting short of an intact reference (HTF pivot,
 //        EQ band, or unfilled FVG edge); label carries the reference type (H=HTF pivot, Q=EQ band, G=FVG)
-//   LB   liquidity block [MA][IE]: the level that was swept, kept LIVE as the entry-and-stop anchor while its target pool is
-//        unrun; labelled LB BUY / LB SELL with generation and target, or LB INVALID with the reason it fails the gates
+//   LB   liquidity block [MA][IE]: a level that was spiked and closed back, kept as the entry-and-stop anchor while its target
+//        pool is unrun. LB? = pending (waiting for the structure break), LB SELL / LB BUY gN -> target type R = armed,
+//        LB inv / LB lowp / LB x = failed a gate, no break in time, or ended (reason in the tooltip)
 //   SWP / GRAB / RUN  sweep classification of the taking candle [MM]
 //   IND  inducement box [MA][PH]: the pullback zone after a leg broke a prior pivot; no-trade shading
 //   S / W  strong / weak pivot [PH]
@@ -87,10 +100,16 @@ sessKeep  = input.int(3, "Sessions kept per type", minval = 1, maxval = 20, grou
 gL = "5b. Liquidity block engine (InterEquity coaching call -UtPvA5LuuU, 2026-09-12)"
 showLB       = input.bool(true, "Live liquidity blocks (drawn in focus mode too)", group = gL, tooltip = "A swept level stops being history and becomes the object the presenter actually trades from: entry at the block, stop beyond it, target the opposite pool.")
 lbNeedTarget = input.bool(true, "Require an unrun opposite pool (28:45: no liquidity to target, the setup is invalid)", group = gL)
-lbNeedInduce = input.bool(true, "Require induced traders in the leg (55:37: without any early buyers before the break it is invalid)", group = gL, tooltip = "The leg that ran into the sweep must contain at least one confirmed same-side pivot, so somebody was trapped before the break. A straight run with no internal swing is his INVALID schematic.")
+lbNeedInduce = input.bool(true, "Require induced traders in the leg (55:42: without any early buyers before the break it is invalid)", group = gL, tooltip = "The leg AFTER the sweep must print an internal swing before it closes beyond the structure it came from, so early traders were induced before the break. A straight run to the break is his INVALID drawing (55:42-56:09, frame 56:40): 'high chance that price will take that low again'.")
+lbIntPiv     = input.int(2, "Internal swing: bars each side", minval = 1, maxval = 5, group = gL, tooltip = "How the internal swing inside the post-sweep leg is found. He counts by eye; 2 is my choice.")
+lbBosBars    = input.int(48, "Structure break must come within N bars, else low probability", minval = 5, maxval = 500, group = gL, tooltip = "61:40-62:00: a block that never broke structure is 'very low probability'. The window is my choice, not his.")
+lbTgtStruct  = input.bool(true, "Targets: structure lows / highs (unswept higher lows, lower highs)", group = gL, tooltip = "iGHqUTTvKro: 'liquidity above lower highs... liquidity below higher lows'.")
+lbTgtPD      = input.bool(true, "Targets: prior-day high / low while today has not run them", group = gL, tooltip = "-mX823uc5-s: 'I simply marked out previous high and previous low of the previous day.'")
+lbTgtSess    = input.bool(true, "Targets: finished Asia / London / New York highs and lows", group = gL, tooltip = "xaZeNPHwKDw: 'previous days high here. You have London's high here.' Sessions are tracked in focus mode too, but drawn only when session pools are shown.")
+lbTgtHtf     = input.bool(true, "Targets: HTF pivot reference", group = gL)
 lbShowInvalid = input.bool(true, "Draw blocks that fail a gate, greyed, labelled with the reason", group = gL)
 lbMaxGen     = input.int(4, "Max promotions in one chain", minval = 1, maxval = 10, group = gL, tooltip = "03:09: each high that respects the block, moves away and traps early sellers becomes the new block. This caps how many links of that chain are drawn.")
-lbKeep       = input.int(4, "Live blocks kept per side", minval = 1, maxval = 12, group = gL)
+lbKeep       = input.int(4, "Live blocks kept per side (pending blocks get as many slots again)", minval = 1, maxval = 12, group = gL)
 lbDeadKeep   = input.int(24, "Keep a dead or invalid block drawn for N bars", minval = 0, maxval = 500, group = gL, tooltip = "A dead block is history, not a level. 0 removes it the bar it dies. Dead and invalid blocks never use up the live slots.")
 
 gC = "6. Colours"
@@ -132,13 +151,10 @@ type Level
     label lb = na
     box   bx = na
     int   touchBar = na
-    int   phAt = 0        // pivot-high count at birth, so the leg into a later sweep can be tested for internal swings
-    int   plAt = 0
-
-// How many confirmed pivots of each side the chart has printed. A level born at count N whose sweep happens at count N+k
-// had k internal same-side swings in the leg, which is the presenter's test for whether anyone was induced before the break.
-var int phCount = 0
-var int plCount = 0
+    bool  structural = false  // v1.4: a lower high / higher low when it printed, i.e. structure liquidity [MA] iGHqUTTvKro
+    float sweepExt = na       // v1.4: the extreme reached since the sweep, the far edge of the block it may become
+    int   sweepExtBar = na
+    bool  lbDone = false      // v1.4: the block question is settled (born, or it ran without closing back)
 
 var array<Level> highs = array.new<Level>()
 var array<Level> lows  = array.new<Level>()
@@ -247,15 +263,15 @@ styleLevel(Level L, bool dup) =>
     label.set_textcolor(L.lb, c)
     label.set_size(L.lb, L.engineered and not L.swept ? size.small : size.tiny)
 
-newLevel(float p, int b, int side) =>
+newLevel(float p, int b, int side, bool structural) =>
     line ln = line.new(b, p, bar_index, p, color = cLiq, style = line.style_dashed, width = 1)
     label lb = label.new(bar_index, p, "", style = side == 1 ? label.style_label_left : label.style_label_left, color = color.new(color.white, 100), textcolor = cLiq, size = size.tiny)
-    Level.new(price = p, bar = b, side = side, ln = ln, lb = lb, phAt = phCount, plAt = plCount)
+    Level.new(price = p, bar = b, side = side, ln = ln, lb = lb, structural = structural)
 
 // ------------------------------------------------------------------ register pivots: respected / equal detection
 // A new pivot within `band` of an existing unswept level of the same side, not exceeding it by more than `breach`,
 // counts as a TOUCH: the older level becomes respected (LIQ) and the pair is an EQ cluster.
-registerPivot(Level[] arr, float p, int b, int side) =>
+registerPivot(Level[] arr, float p, int b, int side, bool structural) =>
     bool matched = false
     if array.size(arr) > 0
         for i = array.size(arr) - 1 to 0
@@ -267,7 +283,7 @@ registerPivot(Level[] arr, float p, int b, int side) =>
                 matched := true
                 break
     if not matched
-        array.push(arr, newLevel(p, b, side))
+        array.push(arr, newLevel(p, b, side, structural))
         if array.size(arr) > maxLevels
             Level old = array.shift(arr)
             line.delete(old.ln)
@@ -276,14 +292,12 @@ registerPivot(Level[] arr, float p, int b, int side) =>
                 box.delete(old.bx)
 
 if not na(ph)
-    phCount += 1
-    registerPivot(highs, ph, pivBar, 1)
+    registerPivot(highs, ph, pivBar, 1, not na(lastPH) and ph < lastPH)
     prevPH := lastPH
     lastPH := ph
     lastPHBar := pivBar
 if not na(pl)
-    plCount += 1
-    registerPivot(lows, pl, pivBar, -1)
+    registerPivot(lows, pl, pivBar, -1, not na(lastPL) and pl > lastPL)
     prevPL := lastPL
     lastPL := pl
     lastPLBar := pivBar
@@ -292,7 +306,7 @@ if not na(pl)
 float meanBody = ta.sma(math.abs(close - open), runBodyN)[1]
 bool bigBody = math.abs(close - open) >= runBodyMult * meanBody
 
-// ------------------------------------------------------------------ nearest live pool either side (the draw, and the LB's target)
+// ------------------------------------------------------------------ nearest live respected level either side (the noise box)
 nearestLiveAbove() =>
     float best = na
     if array.size(highs) > 0
@@ -310,46 +324,188 @@ nearestLiveBelow() =>
                 best := L.price
     best
 
+// ------------------------------------------------------------------ sessions [ZC][MA][WS]: pools die on first touch, dotted afterwards
+// v1.4: sessions are tracked whenever they can serve as a block target (focus mode included) and drawn only when shown.
+type Sess
+    float hi
+    float lo
+    line hL
+    line lL
+    label hLb
+    label lLb
+    bool hHit = false
+    bool lHit = false
+    box bx
+    bool closed = false   // v1.4: the window has ended, so its high and low are finished pools
+
+trackSession(string sess, color col, string nm, Sess[] store, bool vis) =>
+    color lc = vis ? col : color.new(col, 100)
+    color lbc = vis ? color.new(col, 30) : color.new(col, 100)
+    color tc = vis ? color.white : color.new(color.white, 100)
+    bool inS = not na(time(timeframe.period, sess, sessTz))
+    bool started = inS and not inS[1]
+    bool ended = (not inS) and inS[1]
+    if started
+        Sess s = Sess.new(high, low, line.new(bar_index, high, bar_index, high, color = lc, width = 2), line.new(bar_index, low, bar_index, low, color = lc, width = 2), label.new(bar_index, high, nm + " H", style = label.style_label_left, color = lbc, textcolor = tc, size = size.tiny), label.new(bar_index, low, nm + " L", style = label.style_label_left, color = lbc, textcolor = tc, size = size.tiny), false, false, box.new(bar_index, high, bar_index, low, border_color = vis ? color.new(col, 60) : color.new(col, 100), bgcolor = vis ? color.new(col, 92) : color.new(col, 100)))
+        array.push(store, s)
+        if array.size(store) > sessKeep
+            Sess old = array.shift(store)
+            line.delete(old.hL)
+            line.delete(old.lL)
+            label.delete(old.hLb)
+            label.delete(old.lLb)
+            box.delete(old.bx)
+    if array.size(store) > 0
+        Sess cur = array.get(store, array.size(store) - 1)
+        if ended
+            cur.closed := true
+        if inS
+            cur.hi := math.max(cur.hi, high)
+            cur.lo := math.min(cur.lo, low)
+            line.set_y1(cur.hL, cur.hi)
+            line.set_y2(cur.hL, cur.hi)
+            line.set_y1(cur.lL, cur.lo)
+            line.set_y2(cur.lL, cur.lo)
+            box.set_top(cur.bx, cur.hi)
+            box.set_bottom(cur.bx, cur.lo)
+            box.set_right(cur.bx, bar_index)
+            label.set_y(cur.hLb, cur.hi)
+            label.set_y(cur.lLb, cur.lo)
+        for i = 0 to array.size(store) - 1
+            Sess s = array.get(store, i)
+            bool live = i == array.size(store) - 1 and inS
+            if not live
+                if not s.hHit
+                    line.set_x2(s.hL, bar_index)
+                    label.set_x(s.hLb, bar_index)
+                    if high >= s.hi
+                        s.hHit := true
+                        line.set_style(s.hL, line.style_dotted)
+                        label.set_text(s.hLb, nm + " H hit")
+                        if vis
+                            alert("MWM LiqMap: " + nm + " high taken " + str.tostring(s.hi, format.mintick), alert.freq_once_per_bar_close)
+                if not s.lHit
+                    line.set_x2(s.lL, bar_index)
+                    label.set_x(s.lLb, bar_index)
+                    if low <= s.lo
+                        s.lHit := true
+                        line.set_style(s.lL, line.style_dotted)
+                        label.set_text(s.lLb, nm + " L hit")
+                        if vis
+                            alert("MWM LiqMap: " + nm + " low taken " + str.tostring(s.lo, format.mintick), alert.freq_once_per_bar_close)
+            else
+                line.set_x2(s.hL, bar_index)
+                line.set_x2(s.lL, bar_index)
+                label.set_x(s.hLb, bar_index)
+                label.set_x(s.lLb, bar_index)
+
+var array<Sess> asStore = array.new<Sess>()
+var array<Sess> loStore = array.new<Sess>()
+var array<Sess> nyStore = array.new<Sess>()
+bool sessVis = showSess and not focusMode
+if sessVis or (showLB and lbTgtSess)
+    trackSession(asSess, cAs, "AS", asStore, sessVis)
+    trackSession(loSess, cLo, "LO", loStore, sessVis)
+    trackSession(nySess, cNy, "NY", nyStore, sessVis)
+
+// ------------------------------------------------------------------ prior day / week levels (display and block targets; [1] so no look-ahead)
+float pdh = request.security(syminfo.tickerid, "D", high[1], barmerge.gaps_off, barmerge.lookahead_on)
+float pdl = request.security(syminfo.tickerid, "D", low[1], barmerge.gaps_off, barmerge.lookahead_on)
+float pdc = request.security(syminfo.tickerid, "D", close[1], barmerge.gaps_off, barmerge.lookahead_on)
+float pwh = request.security(syminfo.tickerid, "W", high[1], barmerge.gaps_off, barmerge.lookahead_on)
+float pwl = request.security(syminfo.tickerid, "W", low[1], barmerge.gaps_off, barmerge.lookahead_on)
+// today's running range: a prior-day level is a target only while today has not traded through it
+var float dayHi = na
+var float dayLo = na
+if timeframe.change("D") or na(dayHi)
+    dayHi := high
+    dayLo := low
+else
+    dayHi := math.max(dayHi, high)
+    dayLo := math.min(dayLo, low)
+// v1.4 [IE HEBP5I3z__c]: after a day that "spike the highs, hunt the lows" he expects an inside day and does not trade it.
+// Flag = the prior day traded above the high AND below the low of the day before it.
+bool insideDayFlag = request.security(syminfo.tickerid, "D", high[1] > high[2] and low[1] < low[2], barmerge.gaps_off, barmerge.lookahead_on)
+
 // ------------------------------------------------------------------ the liquidity block as a live object [IE]
 // side = 1: a HIGH was swept, buyers are trapped, the block is a SELL anchor and the target is the pool below.
-// side = -1: mirrored. The block dies when its target pool is taken (the trade is over) or when price closes through it
-// (the block failed and, in his words at 04:42, "becomes trapped"). It is promoted, not replaced, when a lower high inside
-// the chain sweeps its own near pool: that new high becomes the block and the chain keeps the original target.
+// side = -1: mirrored. v1.4 lifecycle, all from the coaching call:
+//   PENDING  born when a swept level closes back inside (a spike, not a run)
+//   ARMED    the leg closes beyond the swing the sweep came from (his protective line, 56:40) after printing an internal
+//            swing first; that swing is the inducement whose stops the setup later takes (03:16-03:27)
+//   INVALID  no pool to target at birth (28:45), or the leg broke straight through with no internal swing (55:42-56:09)
+//   LOW PROB no structure break within lbBosBars (61:40-62:00)
+//   ENDED    the target pool is taken (03:55) or price closes through the block (04:42, "becomes trapped")
+// An armed chain is promoted, not replaced, when a swing inside it that respected the block sweeps its own near pool: that
+// swing becomes the block and the chain keeps the original target (03:39).
 type LBlock
-    float anchor        // the swept level: entry line and the side the stop sits beyond
+    float anchor        // the swept level: entry reference and the side the stop sits beyond
     float far           // the sweep extreme (wick): the far edge of the drawn box, where the stop goes
     int   bar
     int   side
     int   gen = 1
     float target = na
-    bool  valid = true
+    string tgtType = ""
+    float bos = na      // the structure the leg must close beyond for the block to arm
+    int   legBar = na   // bar of the sweep extreme, where the post-sweep leg starts
+    float ind = na      // the internal swing found in that leg: the inducement
+    bool  inPlay = false
+    int   state = 0     // 0 pending, 1 armed, 2 invalid, 3 low probability, 4 ended
     string why = ""
-    bool  dead = false
-    int   endBar = na   // bar the block died, or was born invalid: the drawing freezes here
+    int   endBar = na   // bar the block ended or failed: the drawing freezes here
     box   bx = na
     label lb = na
 var array<LBlock> lbUp = array.new<LBlock>()   // side = 1, sell anchors
 var array<LBlock> lbDn = array.new<LBlock>()   // side = -1, buy anchors
 
+// reward-to-risk from an entry at the swept level and a stop at the wick; display only (his 1:3 minimum at 61:12 is not a filter)
+rrOf(LBlock B) =>
+    float risk = math.abs(B.far - B.anchor)
+    float reward = na(B.target) ? na : (B.side == 1 ? B.anchor - B.target : B.target - B.anchor)
+    risk > 0 and not na(reward) and reward > 0 ? reward / risk : na
+
 styleLB(LBlock B) =>
-    color c = B.dead ? cTrap : B.valid ? cLbLive : color.gray
+    bool live = B.state <= 1
     string dir = B.side == 1 ? "SELL" : "BUY"
-    bool live = B.valid and not B.dead
-    string txt = B.dead ? "LB x" : B.valid ? "LB " + dir + " g" + str.tostring(B.gen) + (na(B.target) ? "" : " -> " + str.tostring(B.target, format.mintick)) : "LB inv"
+    string tg = na(B.target) ? "" : " -> " + str.tostring(B.target, format.mintick) + " " + B.tgtType
+    float r = rrOf(B)
+    color c = color.gray
+    int bdT = 70
+    int bgT = 93
+    string txt = ""
+    string tip = ""
+    if B.state == 0
+        c := cLbLive
+        bdT := 55
+        bgT := 92
+        txt := "LB? " + dir
+        tip := "Pending: arms on a close " + (B.side == 1 ? "below " : "above ") + (na(B.bos) ? "(no structure found)" : str.tostring(B.bos, format.mintick)) + " if the leg prints an internal swing first (55:42-56:09)." + tg
+    else if B.state == 1
+        c := cLbLive
+        bdT := 30
+        bgT := 80
+        txt := "LB " + dir + " g" + str.tostring(B.gen) + tg + (na(r) ? "" : " " + str.tostring(r, "#.#") + "R") + (B.inPlay ? " in play" : "")
+        tip := "Entry reference " + str.tostring(B.anchor, format.mintick) + ", stop beyond " + str.tostring(B.far, format.mintick) + tg + ". R is display only; his minimum is 1:3 (61:12)." + (na(B.ind) ? "" : " Inducement " + str.tostring(B.ind, format.mintick) + ": price taking it while the block holds puts the setup in play (03:16-03:27).")
+    else
+        c := B.state == 4 ? cTrap : color.gray
+        bgT := B.state == 4 ? 95 : 93
+        txt := B.state == 2 ? "LB inv" : B.state == 3 ? "LB lowp" : "LB x"
+        tip := (B.state == 2 ? "LB invalid: " : B.state == 3 ? "LB low probability: " : "LB ended: ") + B.why
     int rightBar = live or na(B.endBar) ? bar_index + 2 : B.endBar + 2
-    box.set_border_color(B.bx, color.new(c, live ? 30 : 70))
-    box.set_bgcolor(B.bx, color.new(c, B.dead ? 95 : B.valid ? 80 : 93))
+    box.set_border_color(B.bx, color.new(c, bdT))
+    box.set_border_style(B.bx, B.state == 0 ? line.style_dashed : line.style_solid)
+    box.set_bgcolor(B.bx, color.new(c, bgT))
     box.set_right(B.bx, rightBar)
     label.set_x(B.lb, rightBar)
     label.set_y(B.lb, B.far)
     label.set_text(B.lb, txt)
-    label.set_tooltip(B.lb, live ? "" : (B.dead ? "LB dead: " : "LB invalid: ") + B.why)
+    label.set_tooltip(B.lb, tip)
     label.set_textcolor(B.lb, c)
 
-newLB(float anchor, float far, int side, int gen, float target, bool valid, string why) =>
-    box bx = box.new(bar_index, math.max(anchor, far), bar_index + 2, math.min(anchor, far), border_color = color.new(cLbLive, 30), bgcolor = color.new(cLbLive, 80))
-    label lb = label.new(bar_index + 2, far, "", style = side == 1 ? label.style_label_left : label.style_label_left, color = color.new(color.white, 100), textcolor = cLbLive, size = size.tiny)
-    LBlock.new(anchor = anchor, far = far, bar = bar_index, side = side, gen = gen, target = target, valid = valid, why = why, endBar = valid ? na : bar_index, bx = bx, lb = lb)
+newLB(float anchor, float far, int side, int leftBar, float target, string ttyp, float bos, int legBar, int state, string why) =>
+    box bx = box.new(leftBar, math.max(anchor, far), bar_index + 2, math.min(anchor, far), border_color = color.new(cLbLive, 30), bgcolor = color.new(cLbLive, 80))
+    label lb = label.new(bar_index + 2, far, "", style = label.style_label_left, color = color.new(color.white, 100), textcolor = cLbLive, size = size.tiny)
+    LBlock.new(anchor = anchor, far = far, bar = bar_index, side = side, target = target, tgtType = ttyp, bos = bos, legBar = legBar, state = state, why = why, endBar = state >= 2 ? bar_index : na, bx = bx, lb = lb)
 
 dropLB(LBlock[] arr, int i) =>
     LBlock B = array.get(arr, i)
@@ -357,38 +513,149 @@ dropLB(LBlock[] arr, int i) =>
     label.delete(B.lb)
     array.remove(arr, i)
 
-// only live blocks use the lbKeep slots: drop the oldest live one when there are too many
-capLiveLB(LBlock[] arr) =>
+// armed blocks use the lbKeep slots, pending blocks get as many of their own; the oldest of a state goes first.
+// Invalid, low-probability and ended blocks never use a slot: they retire after lbDeadKeep bars.
+capLB(LBlock[] arr, int st) =>
     int n = 0
-    int oldest = -1
     if array.size(arr) > 0
-        for i = array.size(arr) - 1 to 0
-            LBlock B = array.get(arr, i)
-            if B.valid and not B.dead
+        for i = 0 to array.size(arr) - 1
+            LBlock X = array.get(arr, i)
+            if X.state == st
                 n += 1
-                oldest := i
-    if n > lbKeep and oldest >= 0
-        dropLB(arr, oldest)
-    n
+    int excess = n - lbKeep
+    if excess > 0
+        for k = 1 to excess
+            int idx = -1
+            if array.size(arr) > 0
+                for i = 0 to array.size(arr) - 1
+                    LBlock X = array.get(arr, i)
+                    if X.state == st
+                        idx := i
+                        break
+            if idx >= 0
+                dropLB(arr, idx)
 
-// A sweep that lands inside an existing chain promotes that chain instead of opening a new one (03:09).
+// A spike that lands inside an armed chain and respects its block promotes the chain instead of opening a new one (03:39).
 promoteLB(LBlock[] arr, float anchor, float far, int side) =>
     bool done = false
     if array.size(arr) > 0
         for i = array.size(arr) - 1 to 0
             LBlock B = array.get(arr, i)
             bool inside = side == 1 ? anchor <= B.anchor + breach : anchor >= B.anchor - breach
-            if not B.dead and B.valid and inside and B.gen < lbMaxGen
+            bool respects = side == 1 ? far <= B.far + breach : far >= B.far - breach
+            if B.state == 1 and inside and respects and B.gen < lbMaxGen
                 B.anchor := anchor
                 B.far := far
                 B.gen += 1
                 B.bar := bar_index
+                B.legBar := bar_index
+                B.ind := na
+                B.inPlay := false
                 box.set_top(B.bx, math.max(anchor, far))
                 box.set_bottom(B.bx, math.min(anchor, far))
-                alert("MWM LiqMap: LB promoted to generation " + str.tostring(B.gen) + " at " + str.tostring(anchor, format.mintick), alert.freq_once_per_bar_close)
+                alert("MWM LiqMap: LB " + (side == 1 ? "SELL" : "BUY") + " promoted to generation " + str.tostring(B.gen) + " at " + str.tostring(anchor, format.mintick) + ": a swing that respected the block trapped early traders", alert.freq_once_per_bar_close)
                 done := true
                 break
     done
+
+// The structure the post-sweep leg must close beyond: the swing the sweep leg came from. SELL block: the lowest low between the
+// last confirmed pivot low printed after the swept level (else the level itself) and the sweep extreme. Mirrored for BUY.
+bosLevel(int side, int levelBar, int extBar) =>
+    int pivB = side == 1 ? lastPLBar : lastPHBar
+    int fromBar = not na(pivB) and pivB > levelBar and pivB < extBar ? pivB : levelBar + 1
+    int o1 = bar_index - extBar + 1
+    int o2 = math.min(bar_index - fromBar, 1990)
+    float b = na
+    if o2 >= o1
+        for o = o1 to o2
+            b := side == 1 ? (na(b) ? low[o] : math.min(b, low[o])) : (na(b) ? high[o] : math.max(b, high[o]))
+    b
+
+// The most recent internal swing of the post-sweep leg (the sweep extreme sits fromOff bars back), k bars each side, all of them
+// inside the leg. SELL block: a swing high (early sellers induced on the way down). BUY block: a swing low. na = a straight run.
+legSwing(int fromOff, int k, int side) =>
+    float found = na
+    if fromOff >= 2 * k
+        for o = k to fromOff - k
+            bool isSw = true
+            for i = 1 to k
+                if side == 1 ? (high[o] <= high[o + i] or high[o] <= high[o - i]) : (low[o] >= low[o + i] or low[o] >= low[o - i])
+                    isSw := false
+                    break
+            if isSw
+                found := side == 1 ? high[o] : low[o]
+                break
+    found
+
+// nearest finished, unrun session pool beyond ref, folded into the running best
+sessBest(Sess[] store, string nm, int side, float ref, float best0, string typ0) =>
+    float best = best0
+    string typ = typ0
+    if array.size(store) > 0
+        for i = 0 to array.size(store) - 1
+            Sess s = array.get(store, i)
+            float p = side == 1 ? s.lo : s.hi
+            bool unrun = side == 1 ? not s.lHit : not s.hHit
+            if s.closed and unrun and (side == 1 ? p < ref : p > ref) and (na(best) or (side == 1 ? p > best : p < best))
+                best := p
+                typ := nm + (side == 1 ? " L" : " H")
+    [best, typ]
+
+// The pool a block trades toward: the nearest unrun pool strictly beyond ref (the structure break, or price when none was found).
+// He never says which of several pools is the draw and warns against over-refining (x-7H1E4ToC8), so nearest wins.
+nearestTarget(int side, float ref) =>
+    float best = na
+    string typ = ""
+    Level[] arr = side == 1 ? lows : highs
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            Level L = array.get(arr, i)
+            bool pool = L.respected or (lbTgtStruct and L.structural)
+            if not L.swept and pool and (side == 1 ? L.price < ref : L.price > ref) and (na(best) or (side == 1 ? L.price > best : L.price < best))
+                best := L.price
+                typ := L.respected ? "LIQ" : "STR"
+    if lbTgtPD
+        float p = side == 1 ? pdl : pdh
+        bool unrun = side == 1 ? dayLo >= pdl - breach : dayHi <= pdh + breach
+        if not na(p) and unrun and (side == 1 ? p < ref : p > ref) and (na(best) or (side == 1 ? p > best : p < best))
+            best := p
+            typ := side == 1 ? "PDL" : "PDH"
+    if lbTgtSess
+        [b1, t1] = sessBest(asStore, "AS", side, ref, best, typ)
+        [b2, t2] = sessBest(loStore, "LO", side, ref, b1, t1)
+        [b3, t3] = sessBest(nyStore, "NY", side, ref, b2, t2)
+        best := b3
+        typ := t3
+    if lbTgtHtf
+        float h = side == 1 ? htfRefLow : htfRefHigh
+        if not na(h) and (side == 1 ? h < ref : h > ref) and (na(best) or (side == 1 ? h > best : h < best))
+            best := h
+            typ := "HTF"
+    [best, typ]
+
+// A swept level that closed back becomes a block: promoted into an armed chain it sits inside, else born pending.
+// Several levels taken by the same spike make ONE block: the existing unarmed block of that spike widens to cover them.
+spawnLB(Level L, int side) =>
+    LBlock[] arr = side == 1 ? lbUp : lbDn
+    bool merged = false
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            LBlock B = array.get(arr, i)
+            if (B.state == 0 or B.state == 2) and B.legBar == L.sweepExtBar
+                B.anchor := side == 1 ? math.min(B.anchor, L.price) : math.max(B.anchor, L.price)
+                box.set_top(B.bx, math.max(B.anchor, B.far))
+                box.set_bottom(B.bx, math.min(B.anchor, B.far))
+                merged := true
+                break
+    if not merged
+        float far = L.sweepExt
+        float bos = bosLevel(side, L.bar, L.sweepExtBar)
+        float ref = na(bos) ? close : (side == 1 ? math.min(close, bos) : math.max(close, bos))
+        [tgt, ttyp] = nearestTarget(side, ref)
+        bool okTgt = not lbNeedTarget or not na(tgt)
+        bool promoted = promoteLB(arr, L.price, far, side)
+        if not promoted and (okTgt or lbShowInvalid)
+            array.push(arr, newLB(L.price, far, side, L.sweptBar, tgt, ttyp, bos, L.sweepExtBar, okTgt ? 0 : 2, okTgt ? "" : "no pool to target (28:45)"))
 
 // v1.3.2: true when another swept level of the same side sits inside the merge distance and was swept later
 // (same bar: the later array slot wins), so only one label of a cluster keeps its text.
@@ -462,31 +729,30 @@ processSide(Level[] arr, int side) =>
                     L.swept := true
                     L.sweptBar := bar_index
                     L.sweepKind := kind
+                    L.sweepExt := side == 1 ? high : low
+                    L.sweepExtBar := bar_index
                     if not focusMode
                         L.bx := box.new(bar_index, side == 1 ? high : L.price, bar_index + 3, side == 1 ? L.price : low, border_color = color.new(cLb, 40), bgcolor = color.new(cLb, 85))
                     if not focusMode
                         label.new(bar_index, side == 1 ? high : low, kind, style = side == 1 ? label.style_label_down : label.style_label_up, color = color.new(cLb, 20), textcolor = color.white, size = size.tiny)
                     alert("MWM LiqMap: " + kind + " of " + (side == 1 ? "high " : "low ") + str.tostring(L.price, format.mintick) + (L.engineered ? " (was ENG-" + L.refType + ")" : ""), alert.freq_once_per_bar_close)
-                    // [IE] the swept level now becomes the liquidity block: the anchor to trade from, not a dead grey line.
-                    if showLB
-                        float far = side == 1 ? high : low
-                        float tgt = side == 1 ? nearestLiveBelow() : nearestLiveAbove()
-                        bool induced = side == 1 ? (phCount - L.phAt >= 1) : (plCount - L.plAt >= 1)
-                        bool okTgt = not lbNeedTarget or not na(tgt)
-                        bool okInd = not lbNeedInduce or induced
-                        string why = not okTgt ? "no pool to target" : not okInd ? "nobody induced in the leg" : ""
-                        bool ok = okTgt and okInd
-                        bool promoted = ok ? (side == 1 ? promoteLB(lbUp, L.price, far, 1) : promoteLB(lbDn, L.price, far, -1)) : false
-                        if not promoted and (ok or lbShowInvalid)
-                            if side == 1
-                                array.push(lbUp, newLB(L.price, far, 1, 1, tgt, ok, why))
-                                capLiveLB(lbUp)
-                            else
-                                array.push(lbDn, newLB(L.price, far, -1, 1, tgt, ok, why))
-                                capLiveLB(lbDn)
-                            if ok
-                                alert("MWM LiqMap: LB " + (side == 1 ? "SELL" : "BUY") + " at " + str.tostring(L.price, format.mintick) + " targeting " + str.tostring(tgt, format.mintick), alert.freq_once_per_bar_close)
+                    // [IE] v1.4: only a spike that closes back becomes a liquidity block ("price spiked it out and moved away",
+                    // x-7H1E4ToC8). A GRAB qualifies on this bar; a close beyond waits below for a close back inside.
+                    if showLB and closedBack
+                        spawnLB(L, side)
+                        L.lbDone := true
             else
+                // v1.4: a sweep that closed beyond gets runConfirm bars to close back inside and become a block; else it ran
+                if showLB and not L.lbDone and bar_index > L.sweptBar
+                    if side == 1 ? high > L.sweepExt : low < L.sweepExt
+                        L.sweepExt := side == 1 ? high : low
+                        L.sweepExtBar := bar_index
+                    bool backIn = side == 1 ? close <= L.price : close >= L.price
+                    if backIn
+                        spawnLB(L, side)
+                        L.lbDone := true
+                    else if bar_index - L.sweptBar >= runConfirm
+                        L.lbDone := true
                 // course 48:45: a run that closes back inside within runConfirm bars is a sweep; otherwise confirm RUN
                 if L.sweepKind == "RUN?" and bar_index - L.sweptBar <= runConfirm
                     bool back = side == 1 ? close <= L.price : close >= L.price
@@ -505,27 +771,65 @@ processSide(highs, 1)
 processSide(lows, -1)
 
 // ------------------------------------------------------------------ liquidity block maintenance [IE]
-// Two deaths, both his: the target pool gets taken, so there is nothing left to trade toward ("once this low is taken you
+// Two endings, both his: the target pool gets taken, so there is nothing left to trade toward ("once this low is taken you
 // can't look anymore for trade", 03:55); or price closes through the block, which flips it into a trap zone (04:42).
+// v1.4: a pending block arms, fails or times out on the structure break of the post-sweep leg; an armed block reports the
+// moment price takes the inducement swing while the block holds.
 processLB(LBlock[] arr) =>
     if array.size(arr) > 0
         for i = array.size(arr) - 1 to 0
             LBlock B = array.get(arr, i)
-            if bar_index - B.bar > maxAgeBars or (not na(B.endBar) and bar_index - B.endBar > lbDeadKeep)
+            bool over = B.state >= 2
+            if bar_index - B.bar > maxAgeBars or (over and (bar_index - B.endBar > lbDeadKeep or (not lbShowInvalid and B.state != 4)))
                 dropLB(arr, i)
                 continue
-            if not B.dead
-                bool tgtTaken = na(B.target) ? false : (B.side == 1 ? low < B.target - breach : high > B.target + breach)
-                bool through = B.side == 1 ? close > B.far + breach : close < B.far - breach
+            if not over
+                bool up = B.side == 1
+                string dir = up ? "SELL" : "BUY"
+                bool tgtTaken = na(B.target) ? false : (up ? low < B.target - breach : high > B.target + breach)
+                bool through = up ? close > B.far + breach : close < B.far - breach
                 if tgtTaken or through
-                    B.dead := true
+                    bool wasArmed = B.state == 1
+                    B.state := 4
                     B.endBar := bar_index
-                    B.why := tgtTaken ? "target pool taken" : "price closed through the block"
-                    alert("MWM LiqMap: LB " + (B.side == 1 ? "SELL" : "BUY") + " at " + str.tostring(B.anchor, format.mintick) + " died: " + B.why, alert.freq_once_per_bar_close)
+                    B.why := (tgtTaken ? "target pool taken" : "price closed through the block") + (wasArmed ? "" : " before the structure broke")
+                    if wasArmed
+                        alert("MWM LiqMap: LB " + dir + " at " + str.tostring(B.anchor, format.mintick) + " ended: " + B.why, alert.freq_once_per_bar_close)
+                else if B.state == 0
+                    // the sweep leg can still extend its extreme while the block waits for the break
+                    if up ? high > B.far : low < B.far
+                        B.far := up ? high : low
+                        B.legBar := bar_index
+                        box.set_top(B.bx, math.max(B.anchor, B.far))
+                        box.set_bottom(B.bx, math.min(B.anchor, B.far))
+                    bool broke = not na(B.bos) and (up ? close < B.bos - breach : close > B.bos + breach)
+                    if broke
+                        B.ind := legSwing(bar_index - B.legBar, lbIntPiv, B.side)
+                        if lbNeedInduce and na(B.ind)
+                            B.state := 2
+                            B.endBar := bar_index
+                            B.why := "the leg broke structure with no internal swing first, nobody was induced (55:42-56:09)"
+                        else
+                            B.state := 1
+                            float r = rrOf(B)
+                            alert("MWM LiqMap: LB " + dir + " armed at " + str.tostring(B.anchor, format.mintick) + ", structure broke at " + str.tostring(B.bos, format.mintick) + (na(B.ind) ? "" : " after an inducement at " + str.tostring(B.ind, format.mintick)) + (na(B.target) ? "" : ", target " + str.tostring(B.target, format.mintick) + " " + B.tgtType) + (na(r) ? "" : ", " + str.tostring(r, "#.#") + "R"), alert.freq_once_per_bar_close)
+                    else if bar_index - B.bar >= lbBosBars
+                        B.state := 3
+                        B.endBar := bar_index
+                        B.why := "no structure break within " + str.tostring(lbBosBars) + " bars (61:40-62:00: very low probability)"
+                else if B.state == 1 and not B.inPlay and not na(B.ind)
+                    bool took = up ? high > B.ind + breach : low < B.ind - breach
+                    if took
+                        B.inPlay := true
+                        alert("MWM LiqMap: LB " + dir + " in play: inducement " + str.tostring(B.ind, format.mintick) + " taken, block " + str.tostring(B.anchor, format.mintick) + " holding", alert.freq_once_per_bar_close)
             styleLB(B)
 
 processLB(lbUp)
 processLB(lbDn)
+capLB(lbUp, 1)
+capLB(lbUp, 0)
+capLB(lbDn, 1)
+capLB(lbDn, 0)
 
 // ------------------------------------------------------------------ inducement boxes [MA][PH]
 // After a close above the last confirmed pivot high (buyers induced), shade the pullback that follows.
@@ -580,86 +884,7 @@ if showNoise and not focusMode and barstate.islast
     if not na(up) and not na(dn)
         noiseBox := box.new(bar_index - 10, up, bar_index + 10, dn, border_color = color.new(cNoise, 60), bgcolor = color.new(cNoise, 92), text = "NOISE", text_color = cNoise, text_size = size.tiny)
 
-// ------------------------------------------------------------------ sessions [ZC][MA][WS]: pools die on first touch, dotted afterwards
-type Sess
-    float hi
-    float lo
-    line hL
-    line lL
-    label hLb
-    label lLb
-    bool hHit = false
-    bool lHit = false
-    box bx
-
-trackSession(string sess, color col, string nm, Sess[] store) =>
-    bool inS = not na(time(timeframe.period, sess, sessTz))
-    bool started = inS and not inS[1]
-    bool ended = (not inS) and inS[1]
-    if started
-        Sess s = Sess.new(high, low, line.new(bar_index, high, bar_index, high, color = col, width = 2), line.new(bar_index, low, bar_index, low, color = col, width = 2), label.new(bar_index, high, nm + " H", style = label.style_label_left, color = color.new(col, 30), textcolor = color.white, size = size.tiny), label.new(bar_index, low, nm + " L", style = label.style_label_left, color = color.new(col, 30), textcolor = color.white, size = size.tiny), false, false, box.new(bar_index, high, bar_index, low, border_color = color.new(col, 60), bgcolor = color.new(col, 92)))
-        array.push(store, s)
-        if array.size(store) > sessKeep
-            Sess old = array.shift(store)
-            line.delete(old.hL)
-            line.delete(old.lL)
-            label.delete(old.hLb)
-            label.delete(old.lLb)
-            box.delete(old.bx)
-    if array.size(store) > 0
-        Sess cur = array.get(store, array.size(store) - 1)
-        if inS
-            cur.hi := math.max(cur.hi, high)
-            cur.lo := math.min(cur.lo, low)
-            line.set_y1(cur.hL, cur.hi)
-            line.set_y2(cur.hL, cur.hi)
-            line.set_y1(cur.lL, cur.lo)
-            line.set_y2(cur.lL, cur.lo)
-            box.set_top(cur.bx, cur.hi)
-            box.set_bottom(cur.bx, cur.lo)
-            box.set_right(cur.bx, bar_index)
-            label.set_y(cur.hLb, cur.hi)
-            label.set_y(cur.lLb, cur.lo)
-        for i = 0 to array.size(store) - 1
-            Sess s = array.get(store, i)
-            bool live = i == array.size(store) - 1 and inS
-            if not live
-                if not s.hHit
-                    line.set_x2(s.hL, bar_index)
-                    label.set_x(s.hLb, bar_index)
-                    if high >= s.hi
-                        s.hHit := true
-                        line.set_style(s.hL, line.style_dotted)
-                        label.set_text(s.hLb, nm + " H hit")
-                        alert("MWM LiqMap: " + nm + " high taken " + str.tostring(s.hi, format.mintick), alert.freq_once_per_bar_close)
-                if not s.lHit
-                    line.set_x2(s.lL, bar_index)
-                    label.set_x(s.lLb, bar_index)
-                    if low <= s.lo
-                        s.lHit := true
-                        line.set_style(s.lL, line.style_dotted)
-                        label.set_text(s.lLb, nm + " L hit")
-                        alert("MWM LiqMap: " + nm + " low taken " + str.tostring(s.lo, format.mintick), alert.freq_once_per_bar_close)
-            else
-                line.set_x2(s.hL, bar_index)
-                line.set_x2(s.lL, bar_index)
-                label.set_x(s.hLb, bar_index)
-                label.set_x(s.lLb, bar_index)
-
-var array<Sess> asStore = array.new<Sess>()
-var array<Sess> loStore = array.new<Sess>()
-var array<Sess> nyStore = array.new<Sess>()
-if showSess and not focusMode
-    trackSession(asSess, cAs, "AS", asStore)
-    trackSession(loSess, cLo, "LO", loStore)
-    trackSession(nySess, cNy, "NY", nyStore)
-
-// ------------------------------------------------------------------ prior day / week levels (display; [1] so no look-ahead)
-float pdh = request.security(syminfo.tickerid, "D", high[1], barmerge.gaps_off, barmerge.lookahead_on)
-float pdl = request.security(syminfo.tickerid, "D", low[1], barmerge.gaps_off, barmerge.lookahead_on)
-float pdc = request.security(syminfo.tickerid, "D", close[1], barmerge.gaps_off, barmerge.lookahead_on)
-float pwh = request.security(syminfo.tickerid, "W", high[1], barmerge.gaps_off, barmerge.lookahead_on)
-float pwl = request.security(syminfo.tickerid, "W", low[1], barmerge.gaps_off, barmerge.lookahead_on)
+// ------------------------------------------------------------------ prior day / week plots (levels computed above)
 plot(showPD and not focusMode ? pdh : na, "PDH", color = color.new(cPd, 0), style = plot.style_linebr, linewidth = 1)
 plot(showPD and not focusMode ? pdl : na, "PDL", color = color.new(cPd, 0), style = plot.style_linebr, linewidth = 1)
 plot(showPD and not focusMode ? pdc : na, "PDC", color = color.new(cPd, 50), style = plot.style_linebr, linewidth = 1)
@@ -677,13 +902,13 @@ if isData830 or isData1000
     label.new(bar_index + 120, low, tag + " L", style = label.style_label_left, color = color.new(cData, 40), textcolor = color.white, size = size.tiny)
 
 // ------------------------------------------------------------------ status table
-var table info = table.new(position.top_right, 1, 7, bgcolor = color.new(color.black, 60))
-countLB(LBlock[] arr) =>
+var table info = table.new(position.top_right, 1, 8, bgcolor = color.new(color.black, 60))
+countLB(LBlock[] arr, int st) =>
     int n = 0
     if array.size(arr) > 0
         for i = 0 to array.size(arr) - 1
             LBlock B = array.get(arr, i)
-            if B.valid and not B.dead
+            if B.state == st
                 n += 1
     n
 countEng(Level[] arr) =>
@@ -703,8 +928,9 @@ countLive(Level[] arr) =>
                 n += 1
     n
 if barstate.islast
-    table.cell(info, 0, 0, "MWM Liquidity Map v1.3.2" + (focusMode ? " (focus)" : ""), text_color = color.white, text_size = size.small)
-    table.cell(info, 0, 6, "live LB sell/buy: " + str.tostring(countLB(lbUp)) + " / " + str.tostring(countLB(lbDn)), text_color = cLbLive, text_size = size.tiny)
+    table.cell(info, 0, 0, "MWM Liquidity Map v1.4" + (focusMode ? " (focus)" : ""), text_color = color.white, text_size = size.small)
+    table.cell(info, 0, 6, "LB armed sell/buy: " + str.tostring(countLB(lbUp, 1)) + " / " + str.tostring(countLB(lbDn, 1)) + "   pending: " + str.tostring(countLB(lbUp, 0)) + " / " + str.tostring(countLB(lbDn, 0)), text_color = cLbLive, text_size = size.tiny)
+    table.cell(info, 0, 7, insideDayFlag ? "prior day ran both sides: inside day expected" : "inside-day flag: off", text_color = insideDayFlag ? color.orange : color.gray, text_size = size.tiny)
     table.cell(info, 0, 1, "live LIQ above/below: " + str.tostring(countLive(highs)) + " / " + str.tostring(countLive(lows)), text_color = cLiq, text_size = size.tiny)
     table.cell(info, 0, 2, "ENG above/below: " + str.tostring(countEng(highs)) + " / " + str.tostring(countEng(lows)), text_color = cEng, text_size = size.tiny)
     table.cell(info, 0, 3, "HTF ref H/L: " + (na(htfRefHigh) ? "none" : str.tostring(htfRefHigh, format.mintick)) + " / " + (na(htfRefLow) ? "none" : str.tostring(htfRefLow, format.mintick)), text_color = color.white, text_size = size.tiny)
