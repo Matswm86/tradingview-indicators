@@ -1,0 +1,766 @@
+// Built with Strategy Architect by QuantCrawler - quantcrawler.com/strategy-architect
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 2e (2026-09-01). Written while chasing a missed MNQ 1m long: sweep of
+// Wednesday's NY low at 14:06 ET, FVG 14:18-14:20, inversion 14:22, manual
+// fill 14:23.
+//
+// THE LIQUIDITY MODEL, and it is the whole model:
+//   * The only pools are the HIGH and the LOW of each completed prior session,
+//     across all three sessions that partition the 24-hour cycle: Asia
+//     1800-0300, London 0300-0930, New York 0930-1600, all New York time.
+//     Nothing else is liquidity. Swing pivots, previous-day high and low, and
+//     the daily midpoint are deleted, because turning ordinary swing structure
+//     into a "pool" produced sweeps that are not part of the model.
+//   * Pool age is counted in DAYS (priorDays, default 20), not in session
+//     closes. Three sessions close per day, so a close-counter would have
+//     expired a 7-day-old Asia low after only 21 closes.
+//   * A pool dies the first time price touches it. One tap and the liquidity is
+//     taken, whether or not it produced a sweep. It is never re-armed.
+//
+// Second missed setup this revision has to catch: sweep of the Tuesday 25 Aug
+// ASIA low at 20:44 Oslo, iFVG at 20:47, long entry 20:48. That pool is 7 days
+// old and belongs to a session the engine was not tracking at all.
+//
+// Fixes carried in from Stage 2d:
+//   1. sessTrack also publishes a finished session on the first bar of the next
+//      session. The old code published only on an out-of-session bar, so on a
+//      chart with Extended Trading Hours OFF it never fired and ZERO
+//      prior-session levels were ever created.
+//   2. The signal window has its own timezone (sigTz), default Europe/Oslo
+//      0700-2100, so level sessions stay on America/New_York 0930-1600.
+//   3. neverVoidSweep (default ON) stops an adverse close between the sweep and
+//      the inversion from killing the live sweep.
+//   4. Loosened detection defaults: minGapPts 2.0 -> 1.0, dispBodyMult
+//      0.5 -> 0.0, reclaimBars 3 -> 5.
+//   5. Status table gained "Sessions captured" and "In signal window" rows,
+//      both of which go red or orange when they are the reason nothing fires.
+//      showDiag stays OFF: it labels every rejected inversion and buries a 1m
+//      chart in grey boxes. Turn it on only to chase one specific setup.
+// ─────────────────────────────────────────────────────────────────────────────
+indicator("iFVG Engine - Stage 2e Sweep + Inversion (prior-session pools only)", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+grpQC = "QuantCrawler"
+automateWithGhost = input.bool(false, "Automate with Ghost", group = grpQC, tooltip = "Automate this indicator/strategy with QuantCrawler's Ghost Automation at quantcrawler.com/get-ghost")
+
+// ═══════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════
+grpDET = "FVG Detection"
+minGapPts    = input.float(1.0, "Min gap size (points)", minval = 0.0, step = 0.25, group = grpDET, tooltip = "Lowered to 1.0 so small but real 1m gaps are not silently dropped. Raise once the engine catches the gaps you draw by hand.")
+maxGapPts    = input.float(0.0, "Max gap size (points, 0 = no cap)", minval = 0.0, step = 0.25, group = grpDET)
+useAtrScale  = input.bool(false, "Auto-scale min size with ATR", group = grpDET, tooltip = "When on, min size becomes the larger of the fixed points value and ATR x multiplier.")
+atrLen       = input.int(14, "ATR length", minval = 1, group = grpDET)
+atrGapMult   = input.float(0.75, "ATR multiplier for min size", minval = 0.05, step = 0.05, group = grpDET)
+dispBodyMult = input.float(0.0, "Displacement: mid-candle body >= ATR x", minval = 0.0, step = 0.1, group = grpDET, tooltip = "0 disables the check. Off by default because it was rejecting valid gaps whose middle candle was fast but not large.")
+maxGaps      = input.int(40, "Max stored gaps", minval = 1, maxval = 100, group = grpDET)
+expireBars   = input.int(200, "Drop untouched gap after N bars", minval = 5, group = grpDET)
+showGapRej   = input.bool(false, "Diagnostics: label gaps rejected on size / displacement", group = grpDET, tooltip = "Turn on if a gap you drew by hand never gets a box.")
+
+grpINV = "Inversion"
+invBufferTicks   = input.float(0.0, "Body-close buffer (ticks)", minval = 0.0, step = 1, group = grpINV, tooltip = "Extra distance the body close must clear beyond the far edge of the gap.")
+invalidOnReclaim = input.bool(true, "Invalidate inverted gap on reclaim", group = grpINV, tooltip = "An inverted gap dies if a body closes back through it in the original direction.")
+invExpireBars    = input.int(60, "Drop inverted gap after N bars", minval = 5, group = grpINV)
+
+// The ONLY liquidity sources are the high and the low of each completed prior
+// SESSION, and the three sessions below partition the whole 24-hour cycle:
+// Asia 1800-0300, London 0300-0930, New York 0930-1600, all New York time.
+// Swing pivots, previous-day high and low, and the daily midpoint stay deleted:
+// they turned ordinary swing structure into a "pool" and produced sweeps that
+// are not part of the model.
+grpLVL = "Liquidity Levels"
+lvlTz            = input.string("America/New_York", "Level-session timezone", group = grpLVL)
+asiaSess         = input.session("1800-0300", "Asia session", group = grpLVL)
+londonSess       = input.session("0300-0930", "London session", group = grpLVL)
+nySess           = input.session("0930-1600", "New York session", group = grpLVL)
+priorDays        = input.int(20, "Days of session history to keep", minval = 1, maxval = 60, group = grpLVL, tooltip = "Measured in calendar days, not session count, so a level from an Asia session 7 days ago survives here regardless of how many sessions closed in between.")
+eqTolTicks       = input.float(0.0, "Equal-level tolerance (ticks)", minval = 0.0, step = 1, group = grpLVL, tooltip = "0 = no merging, every session high and low stays its own level. Above 0, near-identical levels merge into one equal-highs / equal-lows cluster held at the true extreme.")
+maxLevels        = input.int(130, "Max stored levels", minval = 2, maxval = 250, group = grpLVL, tooltip = "20 days x 3 sessions x 2 levels = 120, so 130 leaves headroom. Untouched pools are the only ones that survive, so the live count runs far below this.")
+sweptKeepBars    = input.int(60, "Keep a consumed level drawn for N bars", minval = 0, group = grpLVL, tooltip = "Cosmetic only. The level is dead the instant it is consumed. This just controls how long the dead line stays visible.")
+
+grpSWP = "Sweep"
+requireSweep     = input.bool(true, "Require a sweep before the iFVG", group = grpSWP, tooltip = "Turn off to see raw inversions again (Stage 1 behaviour).")
+swpBufTicks      = input.float(1.0, "Pierce buffer (ticks)", minval = 0.0, step = 1, group = grpSWP)
+reclaimBars      = input.int(5, "Max bars to reclaim the level", minval = 0, maxval = 20, group = grpSWP, tooltip = "0 = the pierce and the reclaim must happen on the same candle. Raised to 5 so a slow reclaim still counts.")
+requireEqual     = input.bool(false, "Only sweeps of equal-highs / lows clusters", group = grpSWP)
+exclusiveSweep   = input.bool(true, "One live sweep side at a time", group = grpSWP, tooltip = "Committing a sweep of a low voids any live sweep of a high, and vice versa.")
+neverVoidSweep   = input.bool(true, "Never void a live sweep on an adverse move", group = grpSWP, tooltip = "ON by default. The old void logic killed a sweep whenever price dipped back below the sweep wick while the entry FVG was still forming.")
+voidOnCloseOnly  = input.bool(true, "If voiding is enabled, void only on a BODY close through the wick", group = grpSWP)
+voidBufPts       = input.float(1.0, "Sweep-void buffer (points)", minval = 0.0, step = 0.25, group = grpSWP, tooltip = "How far beyond the sweep wick price must go before the sweep is considered failed. Ignored while 'Never void' is on.")
+
+grpTIM = "Timing Windows"
+swpValidBars   = input.int(40, "Sweep stays valid for N bars", minval = 1, maxval = 500, group = grpTIM, tooltip = "How long after the sweep an iFVG entry is still allowed. On 1m, 40 = about 40 minutes.")
+gapPreBars     = input.int(30, "Gap may have formed up to N bars BEFORE the sweep", minval = 0, maxval = 500, group = grpTIM, tooltip = "Implements 'the gap that counts is the last one formed before the sweep'. Gaps formed after the sweep are also allowed, bounded by the sweep validity window.")
+invMaxBars     = input.int(20, "Inversion must occur within N bars of gap formation", minval = 1, maxval = 500, group = grpTIM, tooltip = "A gap that sits around for hours before being closed through is not the reversal gap.")
+oneSigPerSweep = input.bool(true, "One signal per sweep", group = grpTIM, tooltip = "Voids the sweep once it has produced an entry signal, so a single sweep cannot fire repeatedly.")
+
+grpCTX = "Reversal Context"
+requireCandleDir      = input.bool(true, "Inversion candle body must match the direction", group = grpCTX, tooltip = "Long needs a bullish body, short needs a bearish body.")
+requireGapBeyondWick  = input.bool(true, "Gap must sit beyond the sweep wick", group = grpCTX, tooltip = "For a long the inverted gap must sit above the sweep low, for a short below the sweep high.")
+requireCloseBeyondLvl = input.bool(false, "Inversion close must be beyond the swept level", group = grpCTX, tooltip = "OFF by default. This gate was rejecting valid inversions that happen while price is still under the swept low / above the swept high.")
+requireBodySpan       = input.bool(false, "Inversion body must span the whole gap", group = grpCTX, tooltip = "Momentum grade: one strong candle body crosses the entire gap. Strict.")
+
+grpSES = "Session"
+restrictSession = input.bool(true, "Restrict signals to session window", group = grpSES)
+sessWindow      = input.session("0700-2100", "Window", group = grpSES, tooltip = "Your trading hours. Read in the signal-window timezone below, NOT the level-session timezone.")
+sigTz           = input.string("Europe/Oslo", "Signal-window timezone", group = grpSES, tooltip = "Separate from the level-session timezone so 0930-1600 can stay New York while your window stays Oslo.")
+
+grpHTF = "Higher-TF Bias (optional)"
+useHtfBias  = input.bool(false, "Filter signals by HTF gap bias", group = grpHTF, tooltip = "Price above the nearest HTF gap midpoint = long bias, below = short bias. Uses the last CONFIRMED higher-timeframe bar.")
+htfTfA      = input.timeframe("60", "Higher timeframe A", group = grpHTF)
+htfTfB      = input.timeframe("240", "Higher timeframe B", group = grpHTF)
+htfAgree    = input.string("Both must agree", "Agreement mode", options = ["Both must agree", "Either is enough"], group = grpHTF)
+showHtfMids = input.bool(true, "Plot HTF gap midpoints", group = grpHTF)
+
+grpVIS = "Visuals"
+showBoxes     = input.bool(true, "Show gap boxes", group = grpVIS)
+showMids      = input.bool(true, "Show gap midpoint lines", group = grpVIS)
+showText      = input.bool(true, "Show size / state text", group = grpVIS)
+extendBars    = input.int(5, "Extend boxes right (bars)", minval = 0, maxval = 100, group = grpVIS)
+showLevels    = input.bool(true, "Show liquidity level lines", group = grpVIS)
+showLevelText = input.bool(true, "Show level labels", group = grpVIS)
+levelExtend   = input.int(3, "Extend level lines right (bars)", minval = 0, maxval = 100, group = grpVIS)
+showSweeps    = input.bool(true, "Show sweep markers", group = grpVIS)
+showStatus    = input.bool(true, "Show status table", group = grpVIS)
+showDiag      = input.bool(false, "Diagnostics: label rejected inversions", group = grpVIS, tooltip = "OFF by default. Turning it on labels EVERY body-close inversion that was not promoted to a signal, which on a 1m chart buries the price action in grey boxes. Use it only while chasing one specific missed setup.")
+colBullRaw    = input.color(color.new(color.teal, 85), "Bullish gap (support)", group = grpVIS)
+colBearRaw    = input.color(color.new(color.red, 85), "Bearish gap (resistance)", group = grpVIS)
+colBullInv    = input.color(color.new(color.aqua, 75), "Inverted -> bullish support", group = grpVIS)
+colBearInv    = input.color(color.new(color.fuchsia, 75), "Inverted -> bearish resistance", group = grpVIS)
+
+// ═══════════════════════════════════════════════════════════════
+// TYPES
+// Fvg  state: 0 = fresh, 1 = inverted   dir: 1 = bullish gap, -1 = bearish gap
+// Fvg  top is ALWAYS the higher price and bot ALWAYS the lower price.
+// Lvl  dir:   1 = high (sell-side above), -1 = low (buy-side below)
+// Lvl  sessIdx: index of the completed session that produced it (na = other source)
+// ═══════════════════════════════════════════════════════════════
+type Fvg
+    float top
+    float bot
+    int   dir
+    int   barIdx
+    int   state
+    int   invBar
+    bool  touched
+    box   bx
+    line  mid
+
+type Lvl
+    float  price
+    int    dir
+    int    barIdx
+    string src
+    bool   isEqual
+    bool   touched
+    bool   swept
+    int    sweptBar
+    int    sessIdx
+    line   ln
+    label  lb
+
+var array<Fvg> gaps   = array.new<Fvg>()
+var array<Lvl> levels = array.new<Lvl>()
+
+atrVal = ta.atr(atrLen)
+invBuf = invBufferTicks * syminfo.mintick
+swpBuf = swpBufTicks * syminfo.mintick
+eqTol  = eqTolTicks * syminfo.mintick
+
+// ═══════════════════════════════════════════════════════════════
+// HIGHER-TF NEAREST-GAP BIAS (optional)
+// The [1] history plus lookahead_on gives the last CONFIRMED HTF gap, so no
+// repaint when the HTF bar closes.
+// ═══════════════════════════════════════════════════════════════
+htfFvg() =>
+    var float gTop = na
+    var float gBot = na
+    var int   gDir = 0
+    if low > high[2]
+        gTop := low
+        gBot := high[2]
+        gDir := 1
+    else if high < low[2]
+        gTop := low[2]
+        gBot := high
+        gDir := -1
+    [gTop[1], gBot[1], nz(gDir[1])]
+
+[htfATop, htfABot, htfADir] = request.security(syminfo.tickerid, htfTfA, htfFvg(), lookahead = barmerge.lookahead_on)
+[htfBTop, htfBBot, htfBDir] = request.security(syminfo.tickerid, htfTfB, htfFvg(), lookahead = barmerge.lookahead_on)
+
+htfMidA = htfADir == 0 or na(htfATop) ? na : (htfATop + htfABot) / 2
+htfMidB = htfBDir == 0 or na(htfBTop) ? na : (htfBTop + htfBBot) / 2
+
+biasA = na(htfMidA) ? 0 : close > htfMidA ? 1 : close < htfMidA ? -1 : 0
+biasB = na(htfMidB) ? 0 : close > htfMidB ? 1 : close < htfMidB ? -1 : 0
+
+htfLongOk  = not useHtfBias ? true : htfAgree == "Both must agree" ? (biasA == 1 and biasB == 1) : (biasA == 1 or biasB == 1)
+htfShortOk = not useHtfBias ? true : htfAgree == "Both must agree" ? (biasA == -1 and biasB == -1) : (biasA == -1 or biasB == -1)
+
+// Signal window is read in its OWN timezone, independent of the level sessions.
+sessOk = not restrictSession or not na(time(timeframe.period, sessWindow, sigTz))
+
+// ═══════════════════════════════════════════════════════════════
+// LEVEL SOURCES
+// FIX 1: the old tracker only published on an out-of-session bar. On a chart
+// with Extended Trading Hours OFF, the bar after 16:00 is next day 09:30, which
+// is still in session, so that branch never fired and ZERO session levels were
+// ever created. It now also publishes the finished session on the first bar of
+// the NEXT session, which works on both RTH-only and ETH charts.
+// ═══════════════════════════════════════════════════════════════
+sessTrack(simple string sess, simple string tz) =>
+    var bool  prevIn = false
+    var float hi     = na
+    var float lo     = na
+    float outHi = na
+    float outLo = na
+    bool  ended = false
+    inS = not na(time(timeframe.period, sess, tz))
+    if not inS and prevIn
+        // ETH path: an out-of-session bar closed the session.
+        outHi := hi
+        outLo := lo
+        ended := true
+        hi := na
+        lo := na
+    else if inS and not prevIn
+        // RTH-only path: a new session opened and the old one was never flushed.
+        if not na(hi)
+            outHi := hi
+            outLo := lo
+            ended := true
+        hi := high
+        lo := low
+    else if inS
+        hi := math.max(hi, high)
+        lo := math.min(lo, low)
+    prevIn := inS
+    [outHi, outLo, ended]
+
+// The three prior-session pools, all read in the level timezone.
+[asiaHi, asiaLo, asiaEnd] = sessTrack(asiaSess,   lvlTz)
+[lonHi,  lonLo,  lonEnd]  = sessTrack(londonSess, lvlTz)
+[nyHi,   nyLo,   nyEnd]   = sessTrack(nySess,     lvlTz)
+
+// Level age is counted in DAYS, not in session closes. Three sessions close per
+// day, so a session-close counter would have expired a 7-day-old Asia low after
+// only 21 closes. This counter does not.
+var int dayCount = 0
+if ta.change(time("D")) != 0
+    dayCount += 1
+
+// Running total of completed sessions, shown in the status table so a reading of
+// zero immediately identifies a session tracker that never fired.
+var int sessDone = 0
+
+// Adds a level, or upgrades an existing near-identical one to an equal cluster.
+// FIX 5: a merged cluster now holds the TRUE extreme (lowest low / highest
+// high), not whichever price happened to be stored first.
+addLevel(float p, int d, int bi, string s, int sIdx) =>
+    if not na(p)
+        bool dup = false
+        if eqTol > 0 and array.size(levels) > 0
+            for i = 0 to array.size(levels) - 1
+                Lvl e = array.get(levels, i)
+                if e.dir == d and not e.swept and math.abs(e.price - p) <= eqTol
+                    dup := true
+                    e.isEqual := true
+                    e.price := d == 1 ? math.max(e.price, p) : math.min(e.price, p)
+                    if not na(e.ln)
+                        line.set_y1(e.ln, e.price)
+                        line.set_y2(e.ln, e.price)
+                    if not na(e.lb)
+                        label.set_y(e.lb, e.price)
+                    // Refresh the age of the cluster so repeated touches keep it alive.
+                    if not na(sIdx)
+                        e.sessIdx := sIdx
+                    if not na(e.lb) and showLevelText
+                        label.set_text(e.lb, "EQ " + e.src)
+        if not dup
+            line nln = na
+            label nlb = na
+            if showLevels
+                nln := line.new(bi, p, bar_index + levelExtend, p, color = color.new(d == 1 ? color.orange : color.lime, 35), style = line.style_dashed, width = 1)
+            if showLevelText
+                nlb := label.new(bar_index + levelExtend, p, s, style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(d == 1 ? color.orange : color.lime, 20), size = size.tiny)
+            array.push(levels, Lvl.new(p, d, bi, s, false, false, false, na, sIdx, nln, nlb))
+
+if barstate.isconfirmed
+    // Each session publishes its high and its low the moment that session closes.
+    // sessIdx stores the DAY the pool was created, which is what expiry uses.
+    if asiaEnd
+        sessDone += 1
+        addLevel(asiaHi, 1, bar_index, "ASIA H", dayCount)
+        addLevel(asiaLo, -1, bar_index, "ASIA L", dayCount)
+    if lonEnd
+        sessDone += 1
+        addLevel(lonHi, 1, bar_index, "LON H", dayCount)
+        addLevel(lonLo, -1, bar_index, "LON L", dayCount)
+    if nyEnd
+        sessDone += 1
+        addLevel(nyHi, 1, bar_index, "NY H", dayCount)
+        addLevel(nyLo, -1, bar_index, "NY L", dayCount)
+    // Keep the level array bounded: oldest goes first.
+    while array.size(levels) > maxLevels
+        Lvl oldL = array.shift(levels)
+        if not na(oldL.ln)
+            line.delete(oldL.ln)
+        if not na(oldL.lb)
+            label.delete(oldL.lb)
+
+// ═══════════════════════════════════════════════════════════════
+// SWEEP ENGINE
+// A sweep = wick pierces the level, then price FAILS to hold there and closes
+// back on the origin side (same bar, or within reclaimBars).
+// ═══════════════════════════════════════════════════════════════
+var Lvl   pendLow      = na
+var int   pendLowBar   = na
+var float pendLowWick  = na
+var bool  pendLowUnt   = false
+var bool  pendLowEq    = false
+
+var Lvl   pendHigh     = na
+var int   pendHighBar  = na
+var float pendHighWick = na
+var bool  pendHighUnt  = false
+var bool  pendHighEq   = false
+
+var int    swpLongBar  = na
+var float  swpLongLvl  = na
+var float  swpLongWick = na
+var bool   swpLongEq   = false
+var bool   swpLongUnt  = false
+var string swpLongSrc  = ""
+
+var int    swpShortBar  = na
+var float  swpShortLvl  = na
+var float  swpShortWick = na
+var bool   swpShortEq   = false
+var bool   swpShortUnt  = false
+var string swpShortSrc  = ""
+
+// Candidates found on this bar.
+bool   cLong     = false
+float  cLongLvl  = na
+float  cLongWick = na
+bool   cLongEq   = false
+bool   cLongUnt  = false
+string cLongSrc  = ""
+
+bool   cShort     = false
+float  cShortLvl  = na
+float  cShortWick = na
+bool   cShortEq   = false
+bool   cShortUnt  = false
+string cShortSrc  = ""
+
+bool sweepLongEvt  = false
+bool sweepShortEvt = false
+
+if barstate.isconfirmed
+    // ── 1) resolve pending pierces from earlier bars ──
+    if not na(pendLow)
+        pendLowWick := math.min(pendLowWick, low)
+        if close > pendLow.price
+            cLong     := true
+            cLongLvl  := pendLow.price
+            cLongWick := pendLowWick
+            cLongEq   := pendLowEq
+            cLongUnt  := pendLowUnt
+            cLongSrc  := pendLow.src
+            pendLow.swept    := true
+            pendLow.sweptBar := bar_index
+            pendLow := na
+        else if bar_index - pendLowBar > reclaimBars
+            pendLow := na
+
+    if not na(pendHigh)
+        pendHighWick := math.max(pendHighWick, high)
+        if close < pendHigh.price
+            cShort     := true
+            cShortLvl  := pendHigh.price
+            cShortWick := pendHighWick
+            cShortEq   := pendHighEq
+            cShortUnt  := pendHighUnt
+            cShortSrc  := pendHigh.src
+            pendHigh.swept    := true
+            pendHigh.sweptBar := bar_index
+            pendHigh := na
+        else if bar_index - pendHighBar > reclaimBars
+            pendHigh := na
+
+    // ── 2) scan levels for new pierces (newest level first) ──
+    if array.size(levels) > 0
+        for i = array.size(levels) - 1 to 0
+            Lvl l = array.get(levels, i)
+            bool dropL = false
+
+            if not na(l.ln)
+                line.set_x2(l.ln, bar_index + levelExtend)
+            if not na(l.lb)
+                label.set_x(l.lb, bar_index + levelExtend)
+
+            if bar_index > l.barIdx and not l.swept
+                bool wasUntouched = not l.touched
+                if l.dir == -1
+                    bool pierced = low < l.price - swpBuf
+                    if pierced and close > l.price
+                        // pierce and reclaim on the same candle
+                        cLong     := true
+                        cLongLvl  := l.price
+                        cLongWick := low
+                        cLongEq   := l.isEqual
+                        cLongUnt  := wasUntouched
+                        cLongSrc  := l.src
+                        l.swept    := true
+                        l.sweptBar := bar_index
+                    else if pierced and reclaimBars > 0 and na(pendLow)
+                        // Keep the NEWEST pierced level rather than letting the
+                        // oldest one overwrite it later in the loop.
+                        pendLow     := l
+                        pendLowBar  := bar_index
+                        pendLowWick := low
+                        pendLowUnt  := wasUntouched
+                        pendLowEq   := l.isEqual
+                else if l.dir == 1
+                    bool pierced = high > l.price + swpBuf
+                    if pierced and close < l.price
+                        cShort     := true
+                        cShortLvl  := l.price
+                        cShortWick := high
+                        cShortEq   := l.isEqual
+                        cShortUnt  := wasUntouched
+                        cShortSrc  := l.src
+                        l.swept    := true
+                        l.sweptBar := bar_index
+                    else if pierced and reclaimBars > 0 and na(pendHigh)
+                        pendHigh     := l
+                        pendHighBar  := bar_index
+                        pendHighWick := high
+                        pendHighUnt  := wasUntouched
+                        pendHighEq   := l.isEqual
+
+                // ONE TOUCH AND THE POOL IS GONE. This runs AFTER the pierce
+                // test, so a same-bar pierce-and-reclaim still registers as a
+                // sweep on the bar that kills the level. Any other tap, price
+                // trading through it or wicking it without reclaiming, consumes
+                // the liquidity just the same and the level never returns.
+                if high >= l.price and low <= l.price
+                    l.touched  := true
+                    l.swept    := true
+                    l.sweptBar := bar_index
+
+            // A consumed level is drawn for sweptKeepBars, then deleted. It is
+            // NEVER re-armed: the liquidity was taken and it does not come back.
+            if l.swept and not na(l.sweptBar) and bar_index - l.sweptBar > sweptKeepBars
+                dropL := true
+
+            // Levels also age out once they are more than priorDays days old.
+            if not na(l.sessIdx) and dayCount - l.sessIdx > priorDays
+                dropL := true
+
+            if dropL
+                if not na(l.ln)
+                    line.delete(l.ln)
+                if not na(l.lb)
+                    label.delete(l.lb)
+                array.remove(levels, i)
+
+    // ── 3) commit qualified sweeps ──
+    bool okLong  = cLong and (not requireEqual or cLongEq)
+    bool okShort = cShort and (not requireEqual or cShortEq)
+
+    if okLong
+        swpLongBar  := bar_index
+        swpLongLvl  := cLongLvl
+        swpLongWick := cLongWick
+        swpLongEq   := cLongEq
+        swpLongUnt  := cLongUnt
+        swpLongSrc  := cLongSrc
+        sweepLongEvt := true
+    if okShort
+        swpShortBar  := bar_index
+        swpShortLvl  := cShortLvl
+        swpShortWick := cShortWick
+        swpShortEq   := cShortEq
+        swpShortUnt  := cShortUnt
+        swpShortSrc  := cShortSrc
+        sweepShortEvt := true
+
+    // Only one side can be live: a fresh trap on one side kills the stale
+    // opposite-side sweep that would otherwise fire a wrong-way signal.
+    if exclusiveSweep
+        if okLong and not okShort
+            swpShortBar := na
+        if okShort and not okLong
+            swpLongBar := na
+
+    // ── 4) void a sweep once price genuinely fails back through its wick ──
+    // FIX 3: neverVoidSweep defaults ON. The old logic killed the sweep whenever
+    // price dipped back under the sweep wick while the entry FVG was still
+    // forming, which removed the setup before the inversion candle closed.
+    float voidBuf = voidBufPts
+    if not neverVoidSweep
+        if not na(swpLongBar) and bar_index > swpLongBar
+            bool failedL = voidOnCloseOnly ? close < swpLongWick - voidBuf : low < swpLongWick - voidBuf
+            if failedL
+                swpLongBar := na
+        if not na(swpShortBar) and bar_index > swpShortBar
+            bool failedS = voidOnCloseOnly ? close > swpShortWick + voidBuf : high > swpShortWick + voidBuf
+            if failedS
+                swpShortBar := na
+
+swpLongFresh  = not na(swpLongBar) and bar_index - swpLongBar <= swpValidBars
+swpShortFresh = not na(swpShortBar) and bar_index - swpShortBar <= swpValidBars
+
+// ═══════════════════════════════════════════════════════════════
+// FVG DETECTION (confirmed bars only, so nothing flickers intrabar)
+// top is ALWAYS the higher edge, bot ALWAYS the lower edge.
+// ═══════════════════════════════════════════════════════════════
+bullGapRaw = low > high[2]
+bearGapRaw = high < low[2]
+
+gapTop = bullGapRaw ? low : bearGapRaw ? low[2] : na
+gapBot = bullGapRaw ? high[2] : bearGapRaw ? high : na
+gapDir = bullGapRaw ? 1 : bearGapRaw ? -1 : 0
+
+midBody    = math.abs(close[1] - open[1])
+displaceOk = dispBodyMult <= 0 or midBody >= atrVal * dispBodyMult
+minSizeReq = useAtrScale ? math.max(minGapPts, atrVal * atrGapMult) : minGapPts
+gapSize    = gapDir == 0 ? na : gapTop - gapBot
+sizeOk     = gapDir != 0 and gapSize >= minSizeReq and (maxGapPts <= 0 or gapSize <= maxGapPts)
+
+boxColOf(int d, int st) =>
+    st == 1 ? (d == 1 ? colBearInv : colBullInv) : (d == 1 ? colBullRaw : colBearRaw)
+
+if barstate.isconfirmed and gapDir != 0 and displaceOk and sizeOk
+    box   nbx = na
+    line  nmd = na
+    if showBoxes
+        nbx := box.new(bar_index - 2, gapTop, bar_index + extendBars, gapBot, border_color = color.new(gapDir == 1 ? color.teal : color.red, 40), bgcolor = boxColOf(gapDir, 0), text = showText ? str.tostring(gapSize, "#.##") : "", text_color = color.new(color.gray, 20), text_size = size.tiny, text_halign = text.align_left, text_valign = text.align_center)
+    if showMids
+        nmd := line.new(bar_index - 2, (gapTop + gapBot) / 2, bar_index + extendBars, (gapTop + gapBot) / 2, color = color.new(color.gray, 30), style = line.style_dotted, width = 1)
+    array.push(gaps, Fvg.new(gapTop, gapBot, gapDir, bar_index, 0, na, false, nbx, nmd))
+    // Keep the array bounded: oldest gap goes first.
+    while array.size(gaps) > maxGaps
+        Fvg old = array.shift(gaps)
+        if not na(old.bx)
+            box.delete(old.bx)
+        if not na(old.mid)
+            line.delete(old.mid)
+
+// Diagnostics for gaps the detector threw away before they ever became boxes.
+if showGapRej and barstate.isconfirmed and gapDir != 0 and not (displaceOk and sizeOk)
+    string gr = not sizeOk ? "gap size " + str.tostring(gapSize, "#.##") + " < " + str.tostring(minSizeReq, "#.##") : "no displacement"
+    label.new(bar_index - 1, gapDir == 1 ? low : high, gr, style = gapDir == 1 ? label.style_label_up : label.style_label_down, color = color.new(color.maroon, 80), textcolor = color.new(color.white, 20), size = size.tiny)
+
+// ═══════════════════════════════════════════════════════════════
+// GAP STATE MACHINE + SIGNAL ELIGIBILITY
+// Loop runs newest -> oldest, so only the NEWEST eligible gap per side can
+// emit a signal. Older gaps still change state, they just do not fire.
+// ═══════════════════════════════════════════════════════════════
+bool invLongRaw  = false
+bool invShortRaw = false
+bool firedLong   = false
+bool firedShort  = false
+float sigGapTop  = na
+float sigGapBot  = na
+
+var string lastRej    = "-"
+var int    lastRejBar = na
+var int    bullLive   = 0
+var int    bearLive   = 0
+
+if barstate.isconfirmed
+    bullLive := 0
+    bearLive := 0
+
+if barstate.isconfirmed and array.size(gaps) > 0
+    for i = array.size(gaps) - 1 to 0
+        Fvg g = array.get(gaps, i)
+        bool drop = false
+
+        // Extend live drawings to the right edge.
+        if not na(g.bx)
+            box.set_right(g.bx, bar_index + extendBars)
+        if not na(g.mid)
+            line.set_x2(g.mid, bar_index + extendBars)
+
+        if bar_index > g.barIdx
+            // Any wick overlap marks the gap as touched.
+            if high >= g.bot and low <= g.top
+                g.touched := true
+
+            if g.state == 0
+                // INVERSION: the body must close all the way through the far edge.
+                // A wick poking through is rejection, not inversion.
+                bool invertedNow = g.dir == 1 ? close < g.bot - invBuf : close > g.top + invBuf
+                if invertedNow
+                    g.state  := 1
+                    g.invBar := bar_index
+
+                    // ── eligibility for emitting a signal, first failing gate wins ──
+                    string rej = ""
+
+                    if g.dir == -1
+                        // bearish gap flipped up = LONG
+                        if bar_index - g.barIdx > invMaxBars
+                            rej := "inv too late"
+                        else if firedLong
+                            rej := "newer gap already fired"
+                        else if requireSweep and not swpLongFresh
+                            rej := "no fresh low sweep"
+                        else if requireSweep and g.barIdx < swpLongBar - gapPreBars
+                            rej := "gap predates sweep window"
+                        else if requireSweep and requireGapBeyondWick and not na(swpLongWick) and g.bot <= swpLongWick
+                            rej := "gap not above sweep wick"
+                        else if requireSweep and requireCloseBeyondLvl and not na(swpLongLvl) and close <= swpLongLvl
+                            rej := "close under swept level"
+                        else if requireCandleDir and close <= open
+                            rej := "candle not bullish"
+                        else if requireBodySpan and not (open <= g.bot and close >= g.top)
+                            rej := "body did not span gap"
+                        else if not sessOk
+                            rej := "outside session"
+                        else if not htfLongOk
+                            rej := "HTF bias blocks long"
+
+                        if rej == ""
+                            invLongRaw := true
+                            firedLong  := true
+                            sigGapTop  := g.top
+                            sigGapBot  := g.bot
+                    else
+                        // bullish gap broken down = SHORT
+                        if bar_index - g.barIdx > invMaxBars
+                            rej := "inv too late"
+                        else if firedShort
+                            rej := "newer gap already fired"
+                        else if requireSweep and not swpShortFresh
+                            rej := "no fresh high sweep"
+                        else if requireSweep and g.barIdx < swpShortBar - gapPreBars
+                            rej := "gap predates sweep window"
+                        else if requireSweep and requireGapBeyondWick and not na(swpShortWick) and g.top >= swpShortWick
+                            rej := "gap not below sweep wick"
+                        else if requireSweep and requireCloseBeyondLvl and not na(swpShortLvl) and close >= swpShortLvl
+                            rej := "close above swept level"
+                        else if requireCandleDir and close >= open
+                            rej := "candle not bearish"
+                        else if requireBodySpan and not (open >= g.top and close <= g.bot)
+                            rej := "body did not span gap"
+                        else if not sessOk
+                            rej := "outside session"
+                        else if not htfShortOk
+                            rej := "HTF bias blocks short"
+
+                        if rej == ""
+                            invShortRaw := true
+                            firedShort  := true
+                            sigGapTop   := g.top
+                            sigGapBot   := g.bot
+
+                    if rej != ""
+                        lastRej    := rej
+                        lastRejBar := bar_index
+                        if showDiag
+                            label.new(bar_index, g.dir == -1 ? low : high, rej, style = g.dir == -1 ? label.style_label_up : label.style_label_down, color = color.new(color.gray, 80), textcolor = color.new(color.white, 10), size = size.tiny)
+
+                    if not na(g.bx)
+                        box.set_bgcolor(g.bx, boxColOf(g.dir, 1))
+                        box.set_border_color(g.bx, color.new(g.dir == 1 ? color.fuchsia : color.aqua, 20))
+                        if showText
+                            box.set_text(g.bx, "iFVG " + str.tostring(g.top - g.bot, "#.##"))
+                else if bar_index - g.barIdx > expireBars
+                    drop := true
+            else
+                // Inverted gap: dies on reclaim or after its own expiry window.
+                bool reclaimed = invalidOnReclaim and (g.dir == 1 ? close > g.top : close < g.bot)
+                if reclaimed or bar_index - g.invBar > invExpireBars
+                    drop := true
+
+        if drop
+            if not na(g.bx)
+                box.delete(g.bx)
+            if not na(g.mid)
+                line.delete(g.mid)
+            array.remove(gaps, i)
+        else
+            if g.dir == 1
+                bullLive += 1
+            else
+                bearLive += 1
+
+// ═══════════════════════════════════════════════════════════════
+// SIGNALS: sweep -> reversal -> body close through the gap
+// The arrow prints on the INVERSION bar close. A live fill lands on the next
+// bar open, which is why a 14:22 inversion matches a 14:23 manual entry.
+// ═══════════════════════════════════════════════════════════════
+sigLong  = invLongRaw
+sigShort = invShortRaw
+
+// Consume the sweep so a single trap cannot fire repeatedly.
+if barstate.isconfirmed and oneSigPerSweep
+    if sigLong
+        swpLongBar := na
+    if sigShort
+        swpShortBar := na
+
+// ═══════════════════════════════════════════════════════════════
+// STATUS TABLE
+// ═══════════════════════════════════════════════════════════════
+var table st = na
+if showStatus and barstate.islast
+    if na(st)
+        st := table.new(position.top_right, 2, 10, border_width = 1)
+    string side = swpLongFresh and not swpShortFresh ? "LOW swept (long bias)" : swpShortFresh and not swpLongFresh ? "HIGH swept (short bias)" : swpLongFresh and swpShortFresh ? "BOTH live" : "none"
+    int    age  = swpLongFresh ? bar_index - swpLongBar : swpShortFresh ? bar_index - swpShortBar : na
+    string src  = swpLongFresh ? swpLongSrc : swpShortFresh ? swpShortSrc : "-"
+    string rjTx = na(lastRejBar) ? "-" : lastRej + " (" + str.tostring(bar_index - lastRejBar) + " bars ago)"
+    table.cell(st, 0, 0, "iFVG engine", text_color = color.white, bgcolor = color.new(color.blue, 40), text_size = size.small)
+    table.cell(st, 1, 0, timeframe.period, text_color = color.white, bgcolor = color.new(color.blue, 40), text_size = size.small)
+    table.cell(st, 0, 1, "Sweep state", text_color = color.gray, text_size = size.tiny)
+    table.cell(st, 1, 1, side, text_color = color.white, text_size = size.tiny)
+    table.cell(st, 0, 2, "Bars since sweep", text_color = color.gray, text_size = size.tiny)
+    table.cell(st, 1, 2, na(age) ? "-" : str.tostring(age) + " / " + str.tostring(swpValidBars), text_color = color.white, text_size = size.tiny)
+    table.cell(st, 0, 3, "Sweep source", text_color = color.gray, text_size = size.tiny)
+    table.cell(st, 1, 3, src, text_color = color.white, text_size = size.tiny)
+    table.cell(st, 0, 4, "Live bullish gaps", text_color = color.gray, text_size = size.tiny)
+    table.cell(st, 1, 4, str.tostring(bullLive), text_color = color.white, text_size = size.tiny)
+    table.cell(st, 0, 5, "Live bearish gaps", text_color = color.gray, text_size = size.tiny)
+    table.cell(st, 1, 5, str.tostring(bearLive), text_color = color.white, text_size = size.tiny)
+    table.cell(st, 0, 6, "Live levels", text_color = color.gray, text_size = size.tiny)
+    table.cell(st, 1, 6, str.tostring(array.size(levels)), text_color = array.size(levels) == 0 ? color.red : color.white, text_size = size.tiny)
+    table.cell(st, 0, 7, "Sessions captured", text_color = color.gray, text_size = size.tiny)
+    table.cell(st, 1, 7, str.tostring(sessDone), text_color = sessDone == 0 ? color.red : color.white, text_size = size.tiny)
+    table.cell(st, 0, 8, "In signal window", text_color = color.gray, text_size = size.tiny)
+    table.cell(st, 1, 8, sessOk ? "yes" : "no", text_color = sessOk ? color.lime : color.orange, text_size = size.tiny)
+    table.cell(st, 0, 9, "Last reject", text_color = color.gray, text_size = size.tiny)
+    table.cell(st, 1, 9, rjTx, text_color = color.new(color.orange, 10), text_size = size.tiny)
+
+// ═══════════════════════════════════════════════════════════════
+// PLOTS
+// ═══════════════════════════════════════════════════════════════
+plot(showHtfMids and useHtfBias ? htfMidA : na, "HTF A gap mid", color = color.new(color.orange, 20), style = plot.style_linebr, linewidth = 1)
+plot(showHtfMids and useHtfBias ? htfMidB : na, "HTF B gap mid", color = color.new(color.blue, 20), style = plot.style_linebr, linewidth = 1)
+
+plotshape(showSweeps and sweepLongEvt, "Sweep of a low (buy-side taken)", style = shape.xcross, location = location.belowbar, color = color.new(color.lime, 0), size = size.tiny)
+plotshape(showSweeps and sweepShortEvt, "Sweep of a high (sell-side taken)", style = shape.xcross, location = location.abovebar, color = color.new(color.orange, 0), size = size.tiny)
+
+plotshape(sigLong, "iFVG long (swept low then bearish gap flipped to support)", style = shape.triangleup, location = location.belowbar, color = color.new(color.aqua, 0), size = size.small, text = "iFVG")
+plotshape(sigShort, "iFVG short (swept high then bullish gap flipped to resistance)", style = shape.triangledown, location = location.abovebar, color = color.new(color.fuchsia, 0), size = size.small, text = "iFVG")
+
+// Faint highlight while a sweep is still fresh enough to trade.
+bgcolor(swpLongFresh and not swpShortFresh ? color.new(color.lime, 95) : swpShortFresh and not swpLongFresh ? color.new(color.orange, 95) : na, title = "Fresh sweep window")
+bgcolor(restrictSession and sessOk ? color.new(color.gray, 94) : na, title = "Session window")
+
+// ═══════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════
+if automateWithGhost and sigLong
+    alert('{"action":"buy","price":' + str.tostring(close) + '}', alert.freq_once_per_bar_close)
+if automateWithGhost and sigShort
+    alert('{"action":"sell","price":' + str.tostring(close) + '}', alert.freq_once_per_bar_close)
+
+alertcondition(sigLong, "iFVG long (sweep confirmed)", "Long iFVG: low swept, bearish gap closed through upward")
+alertcondition(sigShort, "iFVG short (sweep confirmed)", "Short iFVG: high swept, bullish gap closed through downward")

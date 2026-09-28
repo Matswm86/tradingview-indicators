@@ -1,0 +1,552 @@
+//@version=6
+indicator("Mechanical Structure", "MechStruct", true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ====================================================================
+// Mechanical Structure - swing and internal market structure mapped by
+// fixed candle-close rules, with imbalance zones, the range midpoint,
+// a multi-timeframe bias readout and a weak-point hit-rate table.
+//
+// The whole model rests on two candle events:
+//   close-DOWN  a bar whose CLOSE is below the PREVIOUS bar's LOW
+//   close-UP    a bar whose CLOSE is above the PREVIOUS bar's HIGH
+//
+// SWING STRUCTURE
+// - A pending high is the running highest high; it becomes a VALID
+//   high the moment a close-down prints. A pending low is the running
+//   lowest low; a close-up validates it. Pending levels draw dotted,
+//   validated levels draw solid. Nothing is valid until its opposing
+//   close confirms it, which is what keeps every minor pullback from
+//   counting as structure.
+// - A break needs a CLOSE beyond a VALIDATED level. A wick beyond and
+//   a close back inside is a sweep, and the level survives the sweep
+//   as a target - that is the whole point of tracking it.
+// - A break in the same direction as the current bias is a BOS. The
+//   first break against it is a CHoCH, and the bias flips there.
+// - On a break, the far side of the new range is anchored to the last
+//   close-AGAINST candle before the break: a bullish break takes the
+//   LOW of the last close-down candle, a bearish break takes the HIGH
+//   of the last close-up candle. That anchor is the STRONG point (the
+//   origin of the move); the pending side is the WEAK point, the side
+//   liquidity sits against and the side price tends to run for.
+//
+// INTERNAL STRUCTURE
+// - The identical machine, restarted at every swing break and held
+//   inactive until the swing range has both ends. Its breaks are iBOS
+//   and iCHoCH. This is where the minor moves inside a swing leg get
+//   read without treating each of them as a trend change.
+//
+// IMBALANCES
+// - Three-bar gaps, optionally kept only while they overlap the live
+//   swing range. Three states: FRESH (never traded into), TESTED (a
+//   wick has entered), and removed - a gap dies only when a BODY
+//   closes fully beyond it, not on a wick through.
+//
+// MIDPOINT
+// - The 50% of the live swing range. Above it is premium, below it is
+//   discount. The model sells from premium and buys from discount.
+//
+// HIGHER TIMEFRAMES
+// - The same machine run on two selectable higher timeframes, shown
+//   as a bias readout and optional levels. Higher-timeframe state
+//   settles on that timeframe's close, so the newest bar can revise.
+//
+// STATS
+// - After each break a weak point is left behind. It counts as HIT
+//   when the next break goes the same way, and MISSED when the next
+//   break goes the other way. The table splits that rate by whether
+//   the leg opened on a BOS or on a CHoCH.
+//
+// Rules are transcribed from a publicly taught manual mapping method.
+// This is an independent implementation, not affiliated with, nor a
+// copy of, any commercial tool built on the same published rules.
+// ====================================================================
+
+// ── 01. Swing structure ─────────────────────────────────────────────
+grpS = "01. Swing structure"
+swOn      = input.bool(true, "Show swing structure", group=grpS, tooltip="The outer structure: one high and one low defining the live trading range, plus the break markers that moved it there.")
+anchorMode= input.string("Close-against candle", "Strong point anchored to", options=["Close-against candle", "Extreme of leg"], group=grpS, tooltip="Where the STRONG side of a new range is placed when a break happens.\n\nClose-against candle: the low of the last close-down candle before a bullish break (mirrored for bearish). This is the literal rule as taught, and it puts the level at the origin candle of the move.\n\nExtreme of leg: the lowest low since the previous break instead. Never worse than the candle rule and often a few points lower, so a sweep of it is a real sweep rather than a wick through an interior candle. Use this if stops keep getting clipped just under the level.")
+swKeep    = input.int(4, "Break markers kept", minval=0, maxval=30, group=grpS, tooltip="How many past BOS / CHoCH markers stay on the chart. Three or four keeps the recent price action legible; raise it to study history.")
+swLblOn   = input.bool(true, "Label current levels (SH/WH/SL/WL)", group=grpS, tooltip="Tag the two live levels at the right edge. SH strong high, WH weak high, SL strong low, WL weak low. A pending, not-yet-validated level is tagged in brackets and drawn dotted.")
+
+// ── 02. Internal structure ──────────────────────────────────────────
+grpI = "02. Internal structure"
+inOn    = input.bool(true, "Show internal structure", group=grpI, tooltip="The minor moves inside the current swing leg, mapped with the same close-down / close-up rules. Restarts at every swing break and only begins once the swing range has both a validated high and a validated low - which is exactly the filter that stops every pullback from reading as a shift.")
+inKeep  = input.int(3, "Internal break markers kept", minval=0, maxval=20, group=grpI)
+inLevels= input.bool(true, "Show internal levels", group=grpI, tooltip="Draw the internal high and low as thin lines. Turn off to keep only the iBOS / iCHoCH markers.")
+
+// ── 03. Imbalances ──────────────────────────────────────────────────
+grpF = "03. Imbalances"
+fvgOn      = input.bool(true, "Show imbalances", group=grpF, tooltip="Three-bar gaps: a bullish gap is the space between the high two bars back and the current low; a bearish gap is the mirror. These are the liquidity gaps price gravitates back into.")
+fvgMinPts  = input.float(1.0, "Minimum size (points)", minval=0, step=0.25, group=grpF, tooltip="Gaps thinner than this are ignored. 1.0 point on MNQ is 4 ticks. Set 0 to keep every true three-bar gap.")
+fvgInRange = input.bool(true, "Only inside the swing range", group=grpF, tooltip="Keep only gaps that overlap the live swing range, and drop the ones that fall outside it when the range moves. This is the taught rule - imbalances are mapped inside the current range, not across the whole chart. Off draws every gap regardless of where the range sits.")
+fvgMid     = input.bool(false, "Draw gap midpoints", group=grpF, tooltip="A dotted line at 50% of each gap. Price pushing through the midpoint is the read that it intends to close the gap rather than react from it.")
+fvgKeep    = input.int(12, "Gaps kept per side", minval=1, maxval=60, group=grpF, tooltip="Oldest gaps beyond this count are deleted per direction, holding the chart under TradingView's drawing limits.")
+fvgExt     = input.int(30, "Extend gaps N bars", minval=1, group=grpF)
+
+// ── 04. Midpoint (premium / discount) ───────────────────────────────
+grpM = "04. Midpoint"
+eqOn   = input.bool(true, "Show 50% of the swing range", group=grpM, tooltip="The equilibrium of the live range. Sells are taken from above it, buys from below it. A signal on the wrong side of this line is the single most common way a mechanically correct setup still loses.")
+eqTint = input.bool(false, "Tint premium / discount", group=grpM, tooltip="Shade the two halves of the range. Off by default because the line alone is usually enough and the tint hides candles.")
+colPrem= input.color(color.new(#a65c4f, 88), "Premium", inline="pd", group=grpM)
+colDisc= input.color(color.new(#7f9a65, 88), "Discount", inline="pd", group=grpM)
+
+// ── 05. Higher timeframes ───────────────────────────────────────────
+grpH = "05. Higher timeframes"
+htfOn  = input.bool(true, "Show higher-timeframe bias", group=grpH, tooltip="Run the same structure machine on two higher timeframes and print their bias in the readout. Alignment across timeframes is the context filter: an entry with the chart against both higher timeframes is a counter-trend trade whether it looks like one or not.")
+htf2   = input.timeframe("60", "Higher timeframe 2", group=grpH)
+htf3   = input.timeframe("240", "Higher timeframe 3", group=grpH)
+htfLvl = input.bool(false, "Draw their levels too", group=grpH, tooltip="Plot each higher timeframe's strong and weak levels on this chart. Useful for targets, busy on a low timeframe.")
+htfPos = input.string("Bottom right", "Readout position", options=["Bottom right", "Bottom left", "Top right", "Top left"], group=grpH)
+
+// ── 06. Stats ───────────────────────────────────────────────────────
+grpT = "06. Weak-point stats"
+stOn  = input.bool(false, "Show weak-point hit rate", group=grpT, tooltip="How often the weak point left behind by a break actually gets taken, measured on this chart's own history. A weak point counts as HIT when the next break runs the same way, MISSED when the next break goes the other way.\n\nSplit by context, because a leg opening on a CHoCH and a leg opening on a BOS are not the same trade. Sample sizes are small on short histories - read the n column before trusting a percentage.")
+stMin = input.int(5, "Hide a row under n =", minval=1, group=grpT, tooltip="Rows with fewer completed legs than this print their count but no percentage, so a 100% from two samples cannot be mistaken for an edge.")
+
+// ── 07. Colors ──────────────────────────────────────────────────────
+grpC = "07. Colors"
+colBull  = input.color(#26A69A, "Bullish", inline="c1", group=grpC)
+colBear  = input.color(#EF5350, "Bearish", inline="c1", group=grpC)
+colStrong= input.color(#B0BEC5, "Strong level", inline="c2", group=grpC, tooltip="Strong is the origin side of the move, weak is the side price is drawn toward.")
+colWeak  = input.color(#FFB74D, "Weak level", inline="c2", group=grpC)
+colInt   = input.color(#90A4AE, "Internal", inline="c3", group=grpC)
+colEqL   = input.color(#78909C, "Midpoint", inline="c3", group=grpC)
+
+bool useLegAnchor = anchorMode == "Extreme of leg"
+float minGap = fvgMinPts
+
+// ====================================================================
+// The structure machine.
+// One call site = one independent instance, so the same code drives
+// the swing structure, the internal structure and each higher
+// timeframe without any of them sharing state.
+//
+//   reset   restart the instance from this bar
+//   enable  allow validation and breaks (false = track extremes only)
+//
+// Returns:
+//   bias      1 bullish, -1 bearish, 0 not yet established
+//   hiLvl / hiBar / hiOk   current high, its bar, whether validated
+//   loLvl / loBar / loOk   current low, its bar, whether validated
+//   brk       1 / -1 on the bar a break closes, else 0
+//   choch     that break was against the prior bias
+// ====================================================================
+f_machine(bool reset, bool enable) =>
+    var int   bias  = 0
+    var float hiLvl = na
+    var int   hiBar = na
+    var bool  hiOk  = false
+    var float loLvl = na
+    var int   loBar = na
+    var bool  loOk  = false
+    var float cdLo  = na          // low of the last close-down candle
+    var int   cdBar = na
+    var float cuHi  = na          // high of the last close-up candle
+    var int   cuBar = na
+    var float legLo = na          // extremes since the last break
+    var float legHi = na
+
+    bool seed = reset or na(hiLvl) or na(loLvl)
+    if seed
+        bias  := reset ? 0 : bias
+        hiLvl := high
+        hiBar := bar_index
+        hiOk  := false
+        loLvl := low
+        loBar := bar_index
+        loOk  := false
+        cdLo  := na
+        cuHi  := na
+        legLo := low
+        legHi := high
+
+    // the two candle events the whole model is built on
+    bool cd = close < low[1]
+    bool cu = close > high[1]
+    if cd
+        cdLo  := low
+        cdBar := bar_index
+    if cu
+        cuHi  := high
+        cuBar := bar_index
+
+    legLo := math.min(nz(legLo, low), low)
+    legHi := math.max(nz(legHi, high), high)
+
+    // a pending level tracks the running extreme; a validated one is fixed
+    if not hiOk and high > hiLvl
+        hiLvl := high
+        hiBar := bar_index
+    if not loOk and low < loLvl
+        loLvl := low
+        loBar := bar_index
+
+    int  brk   = 0
+    bool choch = false
+
+    if enable and not seed
+        // an opposing close validates the pending level
+        if not hiOk and cd
+            hiOk := true
+        if not loOk and cu
+            loOk := true
+
+        if hiOk and close > hiLvl
+            brk   := 1
+            choch := bias == -1
+            bias  := 1
+            if useLegAnchor
+                loLvl := legLo
+                loBar := na
+            else
+                loLvl := nz(cdLo, legLo)
+                loBar := cdBar
+            loOk  := true
+            hiLvl := high
+            hiBar := bar_index
+            hiOk  := false
+            legLo := low
+            legHi := high
+        else if loOk and close < loLvl
+            brk   := -1
+            choch := bias == 1
+            bias  := -1
+            if useLegAnchor
+                hiLvl := legHi
+                hiBar := na
+            else
+                hiLvl := nz(cuHi, legHi)
+                hiBar := cuBar
+            hiOk  := true
+            loLvl := low
+            loBar := bar_index
+            loOk  := false
+            legLo := low
+            legHi := high
+
+    [bias, hiLvl, hiBar, hiOk, loLvl, loBar, loOk, brk, choch]
+
+// ====================================================================
+// Swing structure on the chart timeframe
+// ====================================================================
+[sBias, sHi, sHiBar, sHiOk, sLo, sLoBar, sLoOk, sBrk, sChoch] = f_machine(false, true)
+
+float sEq = (sHi + sLo) / 2
+// bias decides which side is the origin (strong) and which is the draw (weak)
+bool hiIsStrong = sBias == -1
+
+// ── live level lines ────────────────────────────────────────────────
+f_lvlCol(bool isStrong) => isStrong ? colStrong : colWeak
+
+var line  lnHi = na
+var line  lnLo = na
+var label lbHi = na
+var label lbLo = na
+
+if swOn and barstate.islast and not na(sHi) and not na(sLo)
+    line.delete(lnHi)
+    line.delete(lnLo)
+    label.delete(lbHi)
+    label.delete(lbLo)
+    int xHi = math.max(0, na(sHiBar) ? bar_index - 1 : sHiBar)
+    int xLo = math.max(0, na(sLoBar) ? bar_index - 1 : sLoBar)
+    lnHi := line.new(xHi, sHi, bar_index, sHi, xloc=xloc.bar_index, extend=extend.right,
+         color=f_lvlCol(hiIsStrong), width=sHiOk ? 2 : 1,
+         style=sHiOk ? line.style_solid : line.style_dotted)
+    lnLo := line.new(xLo, sLo, bar_index, sLo, xloc=xloc.bar_index, extend=extend.right,
+         color=f_lvlCol(not hiIsStrong), width=sLoOk ? 2 : 1,
+         style=sLoOk ? line.style_solid : line.style_dotted)
+    if swLblOn
+        // brackets mean the level is still pending its confirming close
+        string tHi = (hiIsStrong ? "SH" : "WH")
+        string tLo = (hiIsStrong ? "WL" : "SL")
+        lbHi := label.new(bar_index + 4, sHi, sHiOk ? tHi : "(" + tHi + ")", xloc=xloc.bar_index,
+             style=label.style_label_left, color=color.new(color.black, 100),
+             textcolor=color.new(f_lvlCol(hiIsStrong), sHiOk ? 0 : 40), size=size.small)
+        lbLo := label.new(bar_index + 4, sLo, sLoOk ? tLo : "(" + tLo + ")", xloc=xloc.bar_index,
+             style=label.style_label_left, color=color.new(color.black, 100),
+             textcolor=color.new(f_lvlCol(not hiIsStrong), sLoOk ? 0 : 40), size=size.small)
+
+// ── break markers ───────────────────────────────────────────────────
+var array<line>  brkLn = array.new<line>()
+var array<label> brkLb = array.new<label>()
+var array<line>  brkLnI = array.new<line>()
+var array<label> brkLbI = array.new<label>()
+
+// `thin` selects the internal set, so swing and internal markers age out
+// against their own limits instead of evicting each other
+f_mark(int d, bool isChoch, float lvl, int fromBar, int keep, color col, string tag, string subTag, bool thin) =>
+    if keep > 0 and not na(lvl)
+        array<line>  aL = thin ? brkLnI : brkLn
+        array<label> aB = thin ? brkLbI : brkLb
+        int x1 = math.max(0, na(fromBar) ? bar_index - 1 : math.min(fromBar, bar_index - 1))
+        line l = line.new(x1, lvl, bar_index, lvl, xloc=xloc.bar_index,
+             color=color.new(col, 25), width=thin ? 1 : 2, style=line.style_dashed)
+        label b = label.new(bar_index, lvl, isChoch ? subTag : tag, xloc=xloc.bar_index,
+             style=d == 1 ? label.style_label_up : label.style_label_down,
+             color=color.new(col, 100), textcolor=color.new(col, 0),
+             size=thin ? size.tiny : size.small)
+        aL.push(l)
+        aB.push(b)
+        while aL.size() > keep
+            line.delete(aL.shift())
+            label.delete(aB.shift())
+
+// the broken level is the one that was standing before the machine moved it:
+// on a bullish break that is the previous high, on a bearish break the previous low
+if swOn and sBrk != 0
+    f_mark(sBrk, sChoch, sBrk == 1 ? sHi[1] : sLo[1], sBrk == 1 ? sHiBar[1] : sLoBar[1],
+         swKeep, sBrk == 1 ? colBull : colBear, "BOS", "CHoCH", false)
+
+// ====================================================================
+// Internal structure - same machine, restarted at every swing break,
+// held inactive until the swing range has both ends validated
+// ====================================================================
+bool inReady = sHiOk and sLoOk
+[iBias, iHi, iHiBar, iHiOk, iLo, iLoBar, iLoOk, iBrk, iChoch] = f_machine(sBrk != 0, inReady)
+
+var line lnIHi = na
+var line lnILo = na
+if inOn and inLevels and barstate.islast and not na(iHi) and not na(iLo)
+    line.delete(lnIHi)
+    line.delete(lnILo)
+    lnIHi := line.new(math.max(0, na(iHiBar) ? bar_index - 1 : iHiBar), iHi, bar_index, iHi, xloc=xloc.bar_index,
+         color=color.new(colInt, 30), width=1, style=iHiOk ? line.style_solid : line.style_dotted)
+    lnILo := line.new(math.max(0, na(iLoBar) ? bar_index - 1 : iLoBar), iLo, bar_index, iLo, xloc=xloc.bar_index,
+         color=color.new(colInt, 30), width=1, style=iLoOk ? line.style_solid : line.style_dotted)
+
+if inOn and iBrk != 0
+    f_mark(iBrk, iChoch, iBrk == 1 ? iHi[1] : iLo[1], iBrk == 1 ? iHiBar[1] : iLoBar[1],
+         inKeep, colInt, "iBOS", "iCHoCH", true)
+
+// ====================================================================
+// Imbalances
+// ====================================================================
+var array<box>   fTop  = array.new<box>()
+var array<float> fHi   = array.new<float>()
+var array<float> fLo   = array.new<float>()
+var array<int>   fDir  = array.new<int>()
+var array<bool>  fTest = array.new<bool>()
+var array<line>  fMidL = array.new<line>()
+
+f_addGap(int d, float top, float bot) =>
+    if top - bot >= minGap
+        color c = d == 1 ? colBull : colBear
+        box b = box.new(bar_index - 2, top, bar_index + fvgExt, bot, xloc=xloc.bar_index,
+             border_color=color.new(c, 55), bgcolor=color.new(c, 86))
+        fTop.push(b)
+        fHi.push(top)
+        fLo.push(bot)
+        fDir.push(d)
+        fTest.push(false)
+        line ml = na
+        if fvgMid
+            ml := line.new(bar_index - 2, (top + bot) / 2, bar_index + fvgExt, (top + bot) / 2,
+                 xloc=xloc.bar_index, color=color.new(c, 55), style=line.style_dotted)
+        fMidL.push(ml)
+
+if fvgOn and bar_index > 2
+    // bullish gap: this bar's low sits above the high two bars back
+    if low > high[2]
+        f_addGap(1, low, high[2])
+    if high < low[2]
+        f_addGap(-1, low[2], high)
+
+bool fvgTouched = false
+if fTop.size() > 0
+    for k = fTop.size() - 1 to 0
+        float t = fHi.get(k)
+        float b = fLo.get(k)
+        int   d = fDir.get(k)
+        // a gap dies only when a BODY closes fully beyond it; a wick through
+        // marks it tested and leaves it on the chart
+        bool dead = d == 1 ? close < b : close > t
+        // out-of-range pruning follows the swing range, not price
+        if not dead and fvgInRange and not na(sHi) and not na(sLo)
+            dead := b > sHi or t < sLo
+        if dead
+            box.delete(fTop.get(k))
+            line.delete(fMidL.get(k))
+            fTop.remove(k)
+            fHi.remove(k)
+            fLo.remove(k)
+            fDir.remove(k)
+            fTest.remove(k)
+            fMidL.remove(k)
+            continue
+        if not fTest.get(k) and low <= t and high >= b
+            fTest.set(k, true)
+            fvgTouched := true
+            box bx = fTop.get(k)
+            color c = d == 1 ? colBull : colBear
+            bx.set_bgcolor(color.new(c, 94))
+            bx.set_border_color(color.new(c, 75))
+        box bx2 = fTop.get(k)
+        bx2.set_right(bar_index + fvgExt)
+        line ml2 = fMidL.get(k)
+        if not na(ml2)
+            ml2.set_x2(bar_index + fvgExt)
+
+// cap the count per direction
+f_capGaps(int d) =>
+    int n = 0
+    if fDir.size() > 0
+        for k = fDir.size() - 1 to 0
+            if fDir.get(k) == d
+                n += 1
+                if n > fvgKeep
+                    box.delete(fTop.get(k))
+                    line.delete(fMidL.get(k))
+                    fTop.remove(k)
+                    fHi.remove(k)
+                    fLo.remove(k)
+                    fDir.remove(k)
+                    fTest.remove(k)
+                    fMidL.remove(k)
+f_capGaps(1)
+f_capGaps(-1)
+
+// price sitting inside a gap, split by freshness - the state the model
+// actually reacts from
+bool inFreshGap = false
+bool inTestedGap = false
+if fTop.size() > 0
+    for k = 0 to fTop.size() - 1
+        if low <= fHi.get(k) and high >= fLo.get(k)
+            if fTest.get(k)
+                inTestedGap := true
+            else
+                inFreshGap := true
+
+// ====================================================================
+// Midpoint of the swing range
+// ====================================================================
+plot(eqOn and not na(sEq) ? sEq : na, "Range midpoint", color=color.new(colEqL, 20),
+     style=plot.style_linebr, linewidth=1, display=display.pane + display.data_window)
+pHi = plot(eqOn and eqTint ? sHi : na, "Range high", display=display.data_window)
+pEq = plot(eqOn and eqTint ? sEq : na, "Range mid",  display=display.data_window)
+pLo = plot(eqOn and eqTint ? sLo : na, "Range low",  display=display.data_window)
+fill(pHi, pEq, color=colPrem, title="Premium")
+fill(pEq, pLo, color=colDisc, title="Discount")
+
+bool inPremium  = not na(sEq) and close > sEq
+bool inDiscount = not na(sEq) and close < sEq
+
+// ====================================================================
+// Higher timeframes
+// ====================================================================
+// Each timeframe needs its OWN f_machine call site: one instance of state
+// per syntactic call, so these cannot be folded into a shared helper.
+[b2, h2, hb2, ho2, l2, lb2, lo2, k2, c2] = request.security(syminfo.tickerid, htf2, f_machine(false, true), lookahead=barmerge.lookahead_off)
+[b3, h3, hb3, ho3, l3, lb3, lo3, k3, c3] = request.security(syminfo.tickerid, htf3, f_machine(false, true), lookahead=barmerge.lookahead_off)
+
+var line lnH2s = na
+var line lnH2w = na
+var line lnH3s = na
+var line lnH3w = na
+if htfOn and htfLvl and barstate.islast
+    line.delete(lnH2s)
+    line.delete(lnH2w)
+    line.delete(lnH3s)
+    line.delete(lnH3w)
+    if not na(h2) and not na(l2)
+        lnH2s := line.new(math.max(0, bar_index - 50), b2 == -1 ? h2 : l2, bar_index, b2 == -1 ? h2 : l2,
+             xloc=xloc.bar_index, extend=extend.right, color=color.new(colStrong, 45), style=line.style_dashed)
+        lnH2w := line.new(math.max(0, bar_index - 50), b2 == -1 ? l2 : h2, bar_index, b2 == -1 ? l2 : h2,
+             xloc=xloc.bar_index, extend=extend.right, color=color.new(colWeak, 45), style=line.style_dashed)
+    if not na(h3) and not na(l3)
+        lnH3s := line.new(math.max(0, bar_index - 50), b3 == -1 ? h3 : l3, bar_index, b3 == -1 ? h3 : l3,
+             xloc=xloc.bar_index, extend=extend.right, color=color.new(colStrong, 65), style=line.style_dotted)
+        lnH3w := line.new(math.max(0, bar_index - 50), b3 == -1 ? l3 : h3, bar_index, b3 == -1 ? l3 : h3,
+             xloc=xloc.bar_index, extend=extend.right, color=color.new(colWeak, 65), style=line.style_dotted)
+
+f_biasTxt(int b) => b == 1 ? "Bullish" : b == -1 ? "Bearish" : "-"
+f_biasCol(int b) => b == 1 ? colBull : b == -1 ? colBear : color.gray
+
+string dashPos = htfPos == "Bottom right" ? position.bottom_right : htfPos == "Bottom left" ? position.bottom_left : htfPos == "Top right" ? position.top_right : position.top_left
+var table dash = table.new(dashPos, 2, 4, border_width=1)
+
+if htfOn and barstate.islast
+    dash.cell(0, 0, timeframe.period, text_color=color.gray, text_size=size.small)
+    dash.cell(1, 0, f_biasTxt(sBias), text_color=f_biasCol(sBias), text_size=size.small)
+    dash.cell(0, 1, htf2, text_color=color.gray, text_size=size.small)
+    dash.cell(1, 1, f_biasTxt(b2), text_color=f_biasCol(b2), text_size=size.small)
+    dash.cell(0, 2, htf3, text_color=color.gray, text_size=size.small)
+    dash.cell(1, 2, f_biasTxt(b3), text_color=f_biasCol(b3), text_size=size.small)
+    dash.cell(0, 3, "internal", text_color=color.gray, text_size=size.small)
+    dash.cell(1, 3, f_biasTxt(iBias), text_color=f_biasCol(iBias), text_size=size.small)
+
+// ====================================================================
+// Weak-point hit rate
+// A break leaves a weak point behind. The NEXT break decides it: same
+// direction means the weak point was taken, opposite means it was not.
+// ====================================================================
+var int pendDir = 0
+var bool pendChoch = false
+var int hiHitB = 0
+var int hiTotB = 0
+var int hiHitC = 0
+var int hiTotC = 0
+var int loHitB = 0
+var int loTotB = 0
+var int loHitC = 0
+var int loTotC = 0
+
+if sBrk != 0
+    if pendDir != 0
+        bool hit = sBrk == pendDir
+        if pendDir == 1
+            if pendChoch
+                hiTotC += 1
+                hiHitC += hit ? 1 : 0
+            else
+                hiTotB += 1
+                hiHitB += hit ? 1 : 0
+        else
+            if pendChoch
+                loTotC += 1
+                loHitC += hit ? 1 : 0
+            else
+                loTotB += 1
+                loHitB += hit ? 1 : 0
+    pendDir := sBrk
+    pendChoch := sChoch
+
+f_pct(int hit, int tot) => tot < stMin ? "n=" + str.tostring(tot) :
+     str.tostring(100.0 * hit / tot, "#.#") + "%  n=" + str.tostring(tot)
+
+var table stTbl = table.new(position.top_right, 3, 4, border_width=1)
+if stOn and barstate.islast
+    stTbl.cell(0, 0, "weak point", text_color=color.gray, text_size=size.tiny)
+    stTbl.cell(1, 0, "high",       text_color=color.gray, text_size=size.tiny)
+    stTbl.cell(2, 0, "low",        text_color=color.gray, text_size=size.tiny)
+    stTbl.cell(0, 1, "after BOS",  text_color=color.gray, text_size=size.tiny)
+    stTbl.cell(1, 1, f_pct(hiHitB, hiTotB), text_color=colBull, text_size=size.tiny)
+    stTbl.cell(2, 1, f_pct(loHitB, loTotB), text_color=colBear, text_size=size.tiny)
+    stTbl.cell(0, 2, "after CHoCH", text_color=color.gray, text_size=size.tiny)
+    stTbl.cell(1, 2, f_pct(hiHitC, hiTotC), text_color=colBull, text_size=size.tiny)
+    stTbl.cell(2, 2, f_pct(loHitC, loTotC), text_color=colBear, text_size=size.tiny)
+    stTbl.cell(0, 3, "all",        text_color=color.gray, text_size=size.tiny)
+    stTbl.cell(1, 3, f_pct(hiHitB + hiHitC, hiTotB + hiTotC), text_color=colBull, text_size=size.tiny)
+    stTbl.cell(2, 3, f_pct(loHitB + loHitC, loTotB + loTotC), text_color=colBear, text_size=size.tiny)
+
+// ====================================================================
+// Exports and alerts
+// ====================================================================
+plot(sBias,  "Swing bias",      display=display.data_window)
+plot(iBias,  "Internal bias",   display=display.data_window)
+plot(sHi,    "Range high",      display=display.data_window)
+plot(sLo,    "Range low",       display=display.data_window)
+plot(sEq,    "Range midpoint",  display=display.data_window)
+plot(b2,     "HTF2 bias",       display=display.data_window)
+plot(b3,     "HTF3 bias",       display=display.data_window)
+plot(inFreshGap ? 1 : 0,  "In fresh imbalance",  display=display.data_window)
+plot(inTestedGap ? 1 : 0, "In tested imbalance", display=display.data_window)
+plot(inPremium ? 1 : inDiscount ? -1 : 0, "Premium(1)/Discount(-1)", display=display.data_window)
+
+alertcondition(sBrk == 1 and not sChoch,  "Bullish BOS",   "Bullish BOS on {{ticker}} {{interval}} at {{close}}")
+alertcondition(sBrk == -1 and not sChoch, "Bearish BOS",   "Bearish BOS on {{ticker}} {{interval}} at {{close}}")
+alertcondition(sBrk == 1 and sChoch,      "Bullish CHoCH", "Bullish CHoCH on {{ticker}} {{interval}} at {{close}}")
+alertcondition(sBrk == -1 and sChoch,     "Bearish CHoCH", "Bearish CHoCH on {{ticker}} {{interval}} at {{close}}")
+alertcondition(iBrk != 0,                 "Internal break", "Internal structure break on {{ticker}} {{interval}} at {{close}}")
+alertcondition(fvgTouched,                "Imbalance tested", "Imbalance first touched on {{ticker}} {{interval}} at {{close}}")
