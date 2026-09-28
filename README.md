@@ -6,12 +6,18 @@ Pine Script v6 indicators for intraday futures, built and tested on MNQ (Micro E
 |---|---|---|
 | EMA x VWAP Engulfing | `EMA_VWAP_Engulfing.pine` | Fast EMA against session VWAP, five setups, a twelve-point confluence score |
 | LiqSweep+iFVG | `LiqSweep_iFVG.pine` | Session-liquidity raid into inverted-FVG reversal |
-| LiqSweep+iFVG Pro +VWAP | `LiqSweep_iFVG_Pro_VWAP.pine` | Same core plus order-flow, auction and anchored-VWAP confluences |
 | Liquidity Map | `Liquidity_Map.pine` | Engineered liquidity, respected levels and live liquidity blocks |
 | LSD Model | `LSD_Model.pine` | Supply/demand zone + liquidity sweep + directional-close entry |
 | Po3 4H | `Po3_4H.pine` | The 10:00 New York 4H candle read on the 1m chart as accumulation, manipulation, distribution |
 | Trend Hub | `Trend_Hub.pine` | Qualified-trend and momentum read across three timeframes |
 | Session Pulse | `Session_Pulse.pine` | Live session volume pace and how much of a normal day's range is spent |
+
+## More advanced indicators
+
+The indicators in this repository are free and open source. I also offer more advanced indicators, invite-only on TradingView, for a small monthly fee.
+
+- TradingView profile: [tradingview.com/u/MatsWilliam](https://www.tradingview.com/u/MatsWilliam/)
+- Subscriptions: [whop.com/tradingview-8018](https://whop.com/tradingview-8018)
 
 ## EMA x VWAP Engulfing
 
@@ -56,25 +62,6 @@ Session-liquidity raid into inverted-FVG reversal.
 - Entry signal: a Fair Value Gap gets body-closed through its far edge against the raid direction (iFVG inversion). One inversion clears every live arm of that direction: one signal per reversal. A gap formed before the sweep can invert; only the inversion has to happen after the raid.
 - Optional modules: equal highs/lows tracking (EQH/EQL) with optional raid-arming, a higher-timeframe FVG confluence filter (5m / 15m / 1h / 4h / daily) with optional gap overlay, session boxes, raid labels, premium/discount dealing-range zones, and Williams-fractal swing-point marks.
 - Signal timing validated on 60 days of real MNQ 1-minute data: the entry triangle prints on the inversion bar (enter next bar).
-
-## Pro +VWAP version
-
-[`LiqSweep_iFVG_Pro_VWAP.pine`](LiqSweep_iFVG_Pro_VWAP.pine) is the same core with order-flow, auction and anchored-VWAP confluences layered on. Everything is toggleable, and a single "Chart density" control (Minimal / Balanced / Full) strips the chart back without touching the individual switches.
-
-![LiqSweep+iFVG Pro on MNQ 5m](assets/liqsweep-ifvg-pro-mnq-5m.png)
-
-- **Volume profile** built from `request.footprint()`: point of control and value-area edges, over a rolling window, per day, or over one fixed clock window (18:00-08:55 New York by default, the overnight auction) whose edges freeze and carry into the session.
-- **Value-area reclaim** markers: price closes beyond a frozen value-area edge and then closes back through it, the failed-auction read.
-- **Cumulative volume delta** drawn as a rescaled strip inside the price pane, with divergence marked at confirmed swings.
-- **SMT divergence** against a correlated market, evaluated only where a tracked level is swept, comparing that market's own extreme over the same session.
-- **Sequencing rule**: optionally require an external pool (a session high or low) to be swept before a sweep of an equal high or low is allowed to arm anything.
-- **Anchored VWAP** from a chosen anchor, with optional standard-deviation bands.
-- **Trade levels** drawn on each signal: entry at the next bar's open, stop behind the swing the sweep ran, target at 1R by default. Display only.
-- **Alerts** for long, short, any entry, level swept, and value-area reclaim, so the markers can be switched off entirely.
-
-The footprint modules need a TradingView plan that includes volume-footprint data, and a symbol with real trade data rather than a CFD proxy. Where footprint data is unavailable those modules draw nothing and the rest of the indicator is unaffected.
-
-It is the largest file here and the slowest to load; run it on one chart, not four.
 
 ## Liquidity Map
 
