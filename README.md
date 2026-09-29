@@ -4,13 +4,15 @@ Pine Script v6 indicators for intraday futures, built and tested on MNQ (Micro E
 
 | Indicator | File | Idea |
 |---|---|---|
-| EMA x VWAP Engulfing | `EMA_VWAP_Engulfing.pine` | Fast EMA against session VWAP, five setups, a twelve-point confluence score |
+| EMA x VWAP Engulfing | `EMA_VWAP_Engulfing.pine` | Fast EMA against session VWAP, five setups, an eleven-point confluence score |
 | LiqSweep+iFVG | `LiqSweep_iFVG.pine` | Session-liquidity raid into inverted-FVG reversal |
 | Liquidity Map | `Liquidity_Map.pine` | Engineered liquidity, respected levels and live liquidity blocks |
 | LSD Model | `LSD_Model.pine` | Supply/demand zone + liquidity sweep + directional-close entry |
 | Po3 4H | `Po3_4H.pine` | The 10:00 New York 4H candle read on the 1m chart as accumulation, manipulation, distribution |
 | Trend Hub | `Trend_Hub.pine` | Qualified-trend and momentum read across three timeframes |
 | Session Pulse | `Session_Pulse.pine` | Live session volume pace and how much of a normal day's range is spent |
+| Mechanical Structure | `MechStructure.pine` | Draft. Swing and internal structure (BOS, CHoCH) from fixed candle-close rules, with imbalances, a range midpoint and a higher-timeframe bias readout |
+| iFVG Engine (Stage 2e) | `iFVG_Engine_Stage2e.pine` | Draft. A prior Asia, London or New York session high or low is swept, then a fair value gap is inverted; prior-session levels only |
 
 ## More advanced indicators
 
@@ -36,14 +38,17 @@ signal looks thin instead of looking exactly like a strong one.
   of the 1-sigma band. The momentum shape exists because the others are structurally
   impossible inside a one-way expansion: an engulfing bar needs an opposite-coloured candle
   to swallow, and a rejection wick needs price to still be near VWAP.
-- **A score, not a chain of gates.** Twelve context checks each pay a point, including
+- **A score, not a chain of gates.** Eleven context checks each pay a point, including
   volume against the same slot of the session on earlier days, VWAP slope, an EMA that is
   still travelling, minutes held on one side of VWAP, the higher timeframe, and the side of
-  a slow third EMA. Every signal is graded A+, A or B. Five checks can be promoted from a
-  point to a hard veto and four are by default.
+  a slow third EMA. Five checks can be promoted from a point to a hard veto and four are by
+  default. A promoted check stops paying its point, so on the defaults six points are
+  reachable. Every signal except a setup E fade is graded A+, A, B or C by the share of the
+  reachable points it earned.
 - **Day quality.** Two session-level gates stand the indicator down on a day trading well
   below its usual pace or travelling well below its usual range by that point of the
-  session, which no per-bar threshold catches.
+  session, which no per-bar threshold catches. The range gate ships on and the volume gate
+  ships off, because its floor has not been measured against a real dead day.
 - **Levels die when taken.** The previous day's high and low, the pre-market pair and the
   Asia pair leave the chart and stop paying their confluence point once a bar trades
   through them.
@@ -98,8 +103,8 @@ course, rather than inventing a new one.
 - **Liquidity**: a 2+ candle swing must form in front of the zone without touching it, in the zone-side half of the setup (fib 50% rule), then structure must break in the setup's direction. A new swing that forms after the break, on the way back to the zone, is a retracement rather than new liquidity; it becomes the liquidity only if structure breaks again. The final leg into the zone may carry at most two retracement swings (the "straight line").
 - **Entry signal**: price sweeps the liquidity, wicks into the zone without a body close inside it, and the first directional close prints the triangle. Stop line at the deepest wick into the zone, targets at 1:3 and 1:4.
 - **Structure age**: a zone expires nine hours after its base candle, measured from the base rather than from the detection bar.
-- **Grading**: each signal carries an A, B or C grade from tap depth, tap volume, approach shape and higher-timeframe agreement.
-- **Session filter** and four alerts: long signal, short signal, zone tapped, liquidity swept.
+- **Grading**: each signal carries an A, B or C grade: A with no flags, B with one, C with two or more. The flags are a shallow tap of a large zone, a low-volume tap, any retracement swing on the approach and more than one break-of-structure leg.
+- **Session filter** and eight alerts: long and short signal, long and short break-of-candle (an earlier entry), long and short higher-timeframe flip (a tap inside a new 30m or 1h candle), zone tapped, liquidity swept.
 
 ## Po3 4H
 
@@ -143,8 +148,8 @@ alignment itself is the mistake it is designed to prevent.
 [`Session_Pulse.pine`](Session_Pulse.pine) is a lower pane that answers two questions about the day
 you are actually in.
 
-- **Volume pace**: how much the session has traded so far against a typical session at the same
-  point, drawn as a strip whose thickness and glow carry the magnitude.
+- **Volume pace**: how much volume is trading now against what the same clock minute averaged
+  over the last 20 sessions, drawn as a ribbon whose thickness and glow carry the magnitude.
 - **Room left**: how much of a typical day's range is already spent, from running session extremes
   only, against an average of the last 20 completed session ranges. Teal means room to travel, red
   means a fresh reversal has little to reach for.
