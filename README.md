@@ -19,7 +19,7 @@ Pine Script v6 indicators for intraday futures, built and tested on MNQ (Micro E
 The indicators in this repository are free and open source. I also offer more advanced indicators, invite-only on TradingView, for a small monthly fee.
 
 - TradingView profile: [tradingview.com/u/MatsWilliam](https://www.tradingview.com/u/MatsWilliam/)
-- Subscriptions: [whop.com/tradingview-8018](https://whop.com/tradingview-8018)
+- Subscriptions: [whop.com/mwm-indicators](https://whop.com/mwm-indicators/)
 
 ## EMA x VWAP Engulfing
 
