@@ -10,7 +10,6 @@ Pine Script v6 indicators for intraday futures, built and tested on MNQ (Micro E
 | Po3 4H | `Po3_4H.pine` | The 10:00 New York 4H candle read on the 1m chart as accumulation, manipulation, distribution |
 | Trend Hub | `Trend_Hub.pine` | Qualified-trend and momentum read across three timeframes |
 | Session Pulse | `Session_Pulse.pine` | Volume, range and price efficiency against the same clock minute on earlier days, read as a market state (v2) |
-| Mechanical Structure | `MechStructure.pine` | Draft. Swing and internal structure (BOS, CHoCH) from fixed candle-close rules, with imbalances, a range midpoint and a higher-timeframe bias readout |
 
 ## More advanced indicators
 
