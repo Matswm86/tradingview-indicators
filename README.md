@@ -6,13 +6,11 @@ Pine Script v6 indicators for intraday futures, built and tested on MNQ (Micro E
 |---|---|---|
 | EMA x VWAP Engulfing | `EMA_VWAP_Engulfing.pine` | Fast EMA against session VWAP, five setups, an eleven-point confluence score |
 | LiqSweep+iFVG | `LiqSweep_iFVG.pine` | Session-liquidity raid into inverted-FVG reversal |
-| Liquidity Map | `Liquidity_Map.pine` | Engineered liquidity, respected levels and live liquidity blocks |
-| LSD Model | `LSD_Model.pine` | Supply/demand zone + liquidity sweep + directional-close entry |
+| Liquidity Map | `Liquidity_Map.pine` | Engineered liquidity, respected levels, live liquidity blocks and the induce-then-trap trade (v1.7.3) |
 | Po3 4H | `Po3_4H.pine` | The 10:00 New York 4H candle read on the 1m chart as accumulation, manipulation, distribution |
 | Trend Hub | `Trend_Hub.pine` | Qualified-trend and momentum read across three timeframes |
-| Session Pulse | `Session_Pulse.pine` | Live session volume pace and how much of a normal day's range is spent |
+| Session Pulse | `Session_Pulse.pine` | Volume, range and price efficiency against the same clock minute on earlier days, read as a market state (v2) |
 | Mechanical Structure | `MechStructure.pine` | Draft. Swing and internal structure (BOS, CHoCH) from fixed candle-close rules, with imbalances, a range midpoint and a higher-timeframe bias readout |
-| iFVG Engine (Stage 2e) | `iFVG_Engine_Stage2e.pine` | Draft. A prior Asia, London or New York session high or low is swept, then a fair value gap is inverted; prior-session levels only |
 
 ## More advanced indicators
 
@@ -88,23 +86,21 @@ course, rather than inventing a new one.
   highs and lows, the higher-timeframe pivot) and shows its reward-to-risk. It is the anchor for
   the entry and the stop, dies only when that pool is taken or price closes through it, and gets
   promoted when a new high respects it and traps early sellers.
-- **Status table** with the live counts and a flag on days that are shaping up as an inside day.
+- **Induce, then trap** (v1.6): a close beyond the last pivot marks the traders it induced (IND), and price
+  later trading through the origin of that leg marks them trapped. The pool on the other side becomes a TRAP
+  box; reactions inside it are counted as engineered liquidity until its `$$$` line is taken.
+- **The trade on each trapped zone** (v1.7.3): entry at the trapped high or low itself, stop beyond the nearest
+  unswept 3-bar swing plus a share of ATR, target at the nearest unswept 3-bar swing beyond the induced leg,
+  else the nearest higher-timeframe or previous-day level. These rules were matched to 27 trades InterEquity
+  draws in 22 of his videos: the entry rule lands on his entry in 8 of 19 replayable setups, and stops and
+  targets match far less often because he picks them by hand. TP and SL outcomes are tallied in the status
+  table as a chart replay, not a backtest.
+- **Footprint at the swept level** (v1.5, needs TradingView Premium footprint data): each sweep bar is tagged
+  FB (failed break) or ABS (absorbed) from the volume traded at and beyond the level. The tags change no
+  block state or alert.
+- **Status table** with the live counts, the trade tally and a flag on days that are shaping up as an inside day.
 - **Focus mode**, on by default, shows engineered liquidity, its draw and respected levels, and
   puts everything else behind a toggle.
-
-## LSD Model
-
-[`LSD_Model.pine`](LSD_Model.pine) implements the "LSD" (Liquidity + Supply/Demand) model taught publicly by Mangoe (mangoe.co playbook and YouTube), coded to the 5-minute futures practice rather than the older 30-minute forex rules.
-
-![LSD Model on MNQ 5m](assets/lsd-model-mnq-5m.png)
-
-- **Zone**: the final opposite-direction candle before an impulsive move (N straight candles, displacement ≥ k×ATR), extended to the next candle's near wick. Optional "accuracy zone" trimming for forex (off by default; the model's author reports it works worse on futures).
-- **Tapped zones**: a zone counts as used only when an opposite-colour candle touches it (a bearish candle into a demand zone, a bullish one into a supply zone) before structure breaks. A same-colour candle touching it does not kill it.
-- **Liquidity**: a 2+ candle swing must form in front of the zone without touching it, in the zone-side half of the setup (fib 50% rule), then structure must break in the setup's direction. A new swing that forms after the break, on the way back to the zone, is a retracement rather than new liquidity; it becomes the liquidity only if structure breaks again. The final leg into the zone may carry at most two retracement swings (the "straight line").
-- **Entry signal**: price sweeps the liquidity, wicks into the zone without a body close inside it, and the first directional close prints the triangle. Stop line at the deepest wick into the zone, targets at 1:3 and 1:4.
-- **Structure age**: a zone expires nine hours after its base candle, measured from the base rather than from the detection bar.
-- **Grading**: each signal carries an A, B or C grade: A with no flags, B with one, C with two or more. The flags are a shallow tap of a large zone, a low-volume tap, any retracement swing on the approach and more than one break-of-structure leg.
-- **Session filter** and eight alerts: long and short signal, long and short break-of-candle (an earlier entry), long and short higher-timeframe flip (a tap inside a new 30m or 1h candle), zone tapped, liquidity swept.
 
 ## Po3 4H
 
@@ -145,16 +141,23 @@ alignment itself is the mistake it is designed to prevent.
 
 ## Session Pulse
 
-[`Session_Pulse.pine`](Session_Pulse.pine) is a lower pane that answers two questions about the day
-you are actually in.
+[`Session_Pulse.pine`](Session_Pulse.pine) (v2) is a lower pane that reads the market you are in against what
+the same clock minute normally looks like over the last 20 sessions. Built for 1m to 15m charts on real
+exchange volume.
 
-- **Volume pace**: how much volume is trading now against what the same clock minute averaged
-  over the last 20 sessions, drawn as a ribbon whose thickness and glow carry the magnitude.
-- **Room left**: how much of a typical day's range is already spent, from running session extremes
-  only, against an average of the last 20 completed session ranges. Teal means room to travel, red
-  means a fresh reversal has little to reach for.
+- **Ribbon and amber line**: rolling relative volume and rolling relative bar range against the median of the
+  same minutes, on a log2 scale so 2x and 0.5x sit symmetric around 1.0x. Medians keep one CPI or FOMC minute
+  from distorting that slot for weeks.
+- **Block volume**: volume since the Asia, London or New York block opened, against a usual block by now.
+- **Three lanes**: the market state, aggressor delta (needs TradingView footprint data) and how much of a usual
+  block's range is already spent.
+- **States**: LIVE, ACTIVE, NORMAL, ABSORB (volume without range), THIN (range without volume), CHOP (low
+  efficiency ratio), COIL (contracted ranges) and DEAD. A state shows only after it held 3 bars.
+- **Live-bar handling**: on the forming bar the expected volume is scaled by the share of the bar already
+  elapsed, so a bar 10 seconds old is not read as dead. A block trading under 40% of its usual volume is
+  flagged as a likely contract roll or holiday.
 
-No predictive claim is attached to either metric.
+Nothing here is backtested and no predictive claim is attached to any state.
 
 ## Disclaimer
 

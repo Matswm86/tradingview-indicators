@@ -1,4 +1,32 @@
 //@version=6
+// MWM Liquidity Map v1.7.3 (2026-10-05, compiled): trade rules matched to InterEquity's own trades, scored against 27 trades
+//   he draws in 22 of his videos.
+//   Entry  = the trapped high (low) itself, on the bar that traps the induced side ("we want to sell above that high",
+//            "anything above this high was a valid sell", SkKjZeY6EN4).
+//   Stop   = the nearest unswept 3-bar swing beyond the entry on the stop side plus ieSwStopAtr x ATR (his stops: median
+//            0.93 ATR beyond that swing, n = 15). Never inside the spike that trapped them. Falls back to the spike stop.
+//   Target = the nearest unswept 3-bar swing high (low) beyond the induced leg's extreme, else the nearest higher-timeframe
+//            pivot or previous-day level. Which swing he picks varies, so no rule matches every trade.
+//   Every rule has an input to fall back to the v1.6.1 behaviour. Outcomes are marked TP / SL on the chart and tallied in
+//   the status table; a bar touching both counts as SL. This is a chart replay, not a backtest.
+// MWM Liquidity Map v1.6 (2026-10-03, compiled): the InterEquity induce -> trap cycle, from "Liquidity Mastery vol 1"
+//   (SkKjZeY6EN4, EURUSD 4h/1h/15m markup).
+//     IND buyers / IND sellers  a close beyond the last confirmed pivot: retail reads it as a BOS and is induced (05:08, 15:50)
+//     Sellers / Buyers trapped  price later trades through the high (low) the inducing leg came from: everyone who entered on
+//                               the BOS is offside (06:02-06:32). The zone beyond that trapped high is where he sells (10:27)
+//     TRAP box + ENG LQ xN      once traders on one side are induced, the pool on the other side is a TRAP: reactions inside it
+//                               are false and only build liquidity, he counts them as engineered liquidity (06:53-07:15).
+//                               The box resolves when its $$$ line is taken.
+//     $$$ / $                   respected pools print $$$ (15:39 "dollar signs to indicate liquidity"); unswept higher lows /
+//                               lower highs print $ in focus mode too (03:24-04:44)
+// MWM Liquidity Map v1.5 (2026-09-28, compiled): the footprint at the swept level. On the bar that pierces a level, one
+//   request.footprint() call is read at that level's price. Two flags:
+//     FB   failed break: price went fbPen+ ticks through, fbBeyond+ of the bar's volume traded beyond the level, the bar closed
+//          back on its own side, and bar delta leaned toward the breakout (the breakout traders are now offside)
+//     ABS  absorbed: the heaviest row at the level is absX+ times the bar's median row, absInto+ of the volume there was
+//          aggression INTO the level, price got at most absPen ticks through, and the bar closed back
+//   On TradingView Premium the buy/sell split comes from 1-second intrabars, so delta mostly restates price. Footprint history
+//   is ~1.3 sessions, so older sweeps read "no flow". The flags change no block state, gate or alert condition.
 // MWM Liquidity Map v1.4 (2026-09-22, compiled) — the LB engine re-read against the InterEquity coaching call -UtPvA5LuuU:
 //   1. A block is born only from a spike that closes back: a GRAB at once, a close beyond gets runConfirm bars to close back
 //      inside, else it was a run and no block ("price spiked it out and moved away", x-7H1E4ToC8).
@@ -45,7 +73,7 @@
 //   NOISE  the box between the nearest unrun level above and below price [MA]
 // No teacher states a tolerance; every threshold below is an input, never a sourced constant.
 // Compile: paste into TradingView Pine Editor v6. Chart TF 1m-15m intended; HTF reference via request.security.
-indicator("MWM Liquidity Map", "MWM LiqMap", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 2000)
+indicator("MWM Liquidity Map v1.7.3", "MWM LiqMap", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 2000)
 
 // ------------------------------------------------------------------ inputs
 g0 = "0. Focus"
@@ -87,7 +115,7 @@ showSW     = input.bool(false, "Strong / weak pivot labels", group = gI, tooltip
 showNoise  = input.bool(true, "Noise box between nearest unrun levels", group = gI)
 
 gT = "5. Sessions and daily levels (clock is an input; no convention is 'correct')"
-sessTz    = input.string("Europe/Oslo", "Session clock", options = ["Europe/Oslo", "America/New_York", "Europe/London"], group = gT, tooltip = "Oslo default per MWM memory (Asia 02-07, London 09-15:30, NY 15:30-22). Zamco's Asia is 01:00-07:00 London. Type the windows below in the clock you chose.")
+sessTz    = input.string("Europe/Oslo", "Session clock", options = ["Europe/Oslo", "America/New_York", "Europe/London"], group = gT, tooltip = "Oslo default: Asia 02-07, London 09-15:30, NY 15:30-22. Zamco's Asia is 01:00-07:00 London. Type the windows below in the clock you chose.")
 asSess    = input.session("0200-0700", "Asia", group = gT)
 loSess    = input.session("0900-1530", "London", group = gT)
 nySess    = input.session("1530-2200", "New York", group = gT)
@@ -112,6 +140,34 @@ lbMaxGen     = input.int(4, "Max promotions in one chain", minval = 1, maxval = 
 lbKeep       = input.int(4, "Live blocks kept per side (pending blocks get as many slots again)", minval = 1, maxval = 12, group = gL)
 lbDeadKeep   = input.int(24, "Keep a dead or invalid block drawn for N bars", minval = 0, maxval = 500, group = gL, tooltip = "A dead block is history, not a level. 0 removes it the bar it dies. Dead and invalid blocks never use up the live slots.")
 
+gF = "5c. Footprint at the swept level"
+fpOn      = input.bool(true, "Read the footprint on every sweep bar", group = gF, tooltip = "Needs TradingView Premium or Ultimate and a symbol with real trades (CME_MINI:MNQ1!). Where footprint data is missing the reading says 'no flow' and nothing else changes.")
+fpTicks   = input.int(1, "Ticks per footprint row", minval = 1, maxval = 20, group = gF, tooltip = "The thresholds below are in ticks, so 1-tick rows match them exactly. Raise it if the chart gets slow.")
+fpTol     = input.int(2, "Rows within N ticks of the level count as AT the level", minval = 0, maxval = 20, group = gF, tooltip = "Library default 2.")
+fbPen     = input.float(2.0, "FB: price went at least N ticks through", minval = 0, step = 0.5, group = gF, tooltip = "Library default 2.")
+fbBeyond  = input.float(0.30, "FB: share of the bar's volume traded beyond the level", minval = 0, maxval = 1, step = 0.05, group = gF, tooltip = "Library default 0.30. Total volume per row, so it does not depend on the buy/sell split.")
+fbNeedDelta = input.bool(true, "FB: bar delta must lean toward the breakout", group = gF, tooltip = "The library's rule. On Premium the delta comes from 1-second up/down closes, so it mostly restates the bar's own direction. Turn off to test FB on volume alone.")
+absX      = input.float(3.0, "ABS: heaviest row at the level vs the bar's median row", minval = 1, step = 0.5, group = gF, tooltip = "Library default 3.0. Total volume per row.")
+absInto   = input.float(0.65, "ABS: share of the volume at the level that was aggression INTO it", minval = 0, maxval = 1, step = 0.05, group = gF, tooltip = "Library default 0.65. Buying into a high, selling into a low. Uses the buy/sell split, so on Premium it is a proxy.")
+absPen    = input.float(4.0, "ABS: price got at most N ticks through", minval = 0, step = 0.5, group = gF, tooltip = "Library default 4.")
+
+gIE = "5d. InterEquity induce -> trap cycle (Liquidity Mastery vol 1, SkKjZeY6EN4)"
+ieOn      = input.bool(true, "Induce / trap cycle and TRAP boxes (drawn in focus mode)", group = gIE, tooltip = "A close beyond the last pivot induces traders (IND). When price later takes the high or low that leg came from, they are trapped. Whenever one side is induced, the pool on the other side becomes a TRAP: reactions there are false and are counted as engineered liquidity (ENG LQ).")
+ieDollar  = input.bool(true, "His labels: $$$ on respected pools, $ on intact higher lows / lower highs (focus mode too)", group = gIE, tooltip = "15:39: dollar signs mark liquidity. 03:24-04:44: a rally that leaves lows intact leaves liquidity below; no high-probability longs while they stand.")
+ieZone    = input.bool(true, "Zone beyond a trapped high / low (his blue box)", group = gIE, tooltip = "10:27: 'anywhere above this high would be now known as an area that we would be selling from'. The zone runs from the trapped high to the spike extreme and ends when price closes through it or the induced leg's extreme is taken.")
+ieTrapAtr = input.float(1.0, "TRAP box height cap (x ATR14)", minval = 0.1, step = 0.25, group = gIE, tooltip = "He draws the box over the whole low by eye. Here it runs from the pool up to the broken level, capped at this many ATR. Not sourced.")
+ieReact   = input.int(3, "ENG LQ reaction: bars a touch must move away", minval = 1, maxval = 30, group = gIE, tooltip = "A reaction counts when a wick enters the TRAP box without taking the pool and price then closes outside the box this many bars later. He counts circles by eye; 3 is my choice.")
+ieKeep    = input.int(2, "Cycles and TRAP boxes kept per side", minval = 1, maxval = 6, group = gIE)
+ieEntries = input.bool(true, "Draw the trade: entry, stop, target, R (display only, not a backtest)", group = gIE, tooltip = "Fires once per trapped zone, on the first close back inside the trapped high (low) after the spike: that close is the entry. Stop beyond the spike extreme plus the buffer below ('stop loss needs to be covering that liquidity block, give yourself a little breathing room', 13:57). Target = the induced leg's extreme, the $$$ of the TRAP box the trap created (07:15, 13:58).")
+ieStopBuf = input.float(0.1, "Stop buffer beyond the spike (x ATR14)", minval = 0, step = 0.05, group = gIE, tooltip = "His 'breathing room' has no number. Not sourced.")
+ieMinR    = input.float(1.0, "Skip trades below this reward-to-risk", minval = 0, step = 0.5, group = gIE, tooltip = "He calls a 1:1.6 'a really hard entry to take' (18:31) and quotes 1:3 elsewhere (coaching call 61:12). 1.0 shows most setups; raise it to filter.")
+ieTradeLbl = input.bool(false, "Trade text box (entry, SL, TP, R) next to each entry", group = gIE, tooltip = "Off: the triangles, the entry/stop/target lines and the status-table tally carry the trade.")
+ieTradeKeep = input.int(40, "Finished trades kept on the chart", minval = 1, maxval = 100, group = gIE, tooltip = "Each trade uses 3 lines and 1 label of the 500 allowed. 40 covers about 9 days on MNQ 5m (my calc, Jun-Sep 2026 replay: 4.4 trades a day).")
+ieEntryMode = input.string("At the trapped level (his)", "Trade entry", options = ["At the trapped level (his)", "Close back inside (v1.6)"], group = gIE, tooltip = "His: sell at the trapped high on the bar that traps the induced sellers. v1.6: wait for the first close back inside.")
+ieTgtMode = input.string("3-bar swing beyond the leg (his)", "Trade target", options = ["3-bar swing beyond the leg (his)", "HTF pool beyond the leg (his)", "Induced leg extreme (v1.6)"], group = gIE, tooltip = "His: the nearest HTF pivot / previous day / previous week level beyond the induced leg's extreme. v1.6: the leg's extreme (TRAP $$$).")
+ieStopMode = input.string("3-bar swing + ATR (his)", "Trade stop", options = ["3-bar swing + ATR (his)", "Beyond the spike (v1.7.1)"], group = gIE, tooltip = "His: beyond the nearest unswept 3-bar swing past the entry, plus the ATR buffer below. v1.7.1: beyond the spike that trapped them plus the stop buffer.")
+ieSwStopAtr = input.float(0.93, "Buffer beyond that swing (x ATR14)", minval = 0.0, step = 0.05, group = gIE, tooltip = "Median of his 15 measured stops.")
+
 gC = "6. Colours"
 cLiq  = input.color(#FFD54F, "Respected level", group = gC)
 cEq   = input.color(#EF5350, "Equal highs / lows", group = gC)
@@ -134,6 +190,83 @@ float tickSz = syminfo.mintick
 float band = tolMode == "Ticks" ? tolTicks * tickSz : tolAtr * atr
 float breach = breachTk * tickSz
 
+// ------------------------------------------------------------------ footprint at a level
+// One request.footprint() call per script is the Pine limit; this is it. It reads the CURRENT bar only.
+fpBar = fpOn ? request.footprint(fpTicks, 70, 300) : na
+
+// The reading on one sweep bar. lvSide follows the Level convention: 1 = a high was pierced, -1 = a low.
+type FlowRead
+    bool  ok = false
+    float penTicks = na
+    float beyond = na     // share of the bar's volume in rows beyond the level
+    float into = na       // of the volume in rows AT the level, the share that was aggression into it
+    float heavyX = na     // heaviest row at the level / median non-empty row of the bar
+    float delta = na
+    bool  held = false
+    bool  fb = false
+    bool  absorbed = false
+
+// Row matching by price, as in the library; row order does not matter.
+readLevel(float lvl, int lvSide) =>
+    FlowRead r = FlowRead.new()
+    float tol = fpTol * syminfo.mintick
+    r.held := lvSide == 1 ? close < lvl : close > lvl
+    r.penTicks := (lvSide == 1 ? high - lvl : lvl - low) / syminfo.mintick
+    if not na(fpBar)
+        array<volume_row> rows = footprint.rows(fpBar)
+        int n = array.size(rows)
+        float tot = footprint.total_volume(fpBar)
+        if n > 0 and tot > 0
+            array<float> tots = array.new<float>()
+            float atTot = 0.0
+            float atInto = 0.0
+            float atMax = 0.0
+            float beyondV = 0.0
+            for i = 0 to n - 1
+                volume_row rw = array.get(rows, i)
+                float dn = volume_row.down_price(rw)
+                float up = volume_row.up_price(rw)
+                float rb = volume_row.buy_volume(rw)
+                float rs = volume_row.sell_volume(rw)
+                float rt = rb + rs
+                if rt > 0
+                    array.push(tots, rt)
+                if dn <= lvl + tol and up >= lvl - tol
+                    atTot += rt
+                    atInto += lvSide == 1 ? rb : rs
+                    atMax := math.max(atMax, rt)
+                float mid = (dn + up) / 2.0
+                if lvSide == 1 ? mid > lvl : mid < lvl
+                    beyondV += rt
+            float med = array.size(tots) > 0 ? array.median(tots) : na
+            r.ok := true
+            r.delta := footprint.delta(fpBar)
+            r.beyond := beyondV / tot
+            r.into := atTot > 0 ? atInto / atTot : na
+            r.heavyX := not na(med) and med > 0 ? atMax / med : na
+            bool deltaOk = not fbNeedDelta or lvSide * r.delta > 0
+            r.fb := r.held and r.penTicks >= fbPen and r.beyond >= fbBeyond and deltaOk
+            r.absorbed := r.held and not na(r.heavyX) and r.heavyX >= absX and not na(r.into) and r.into >= absInto and r.penTicks <= absPen
+    r
+
+flowTag(FlowRead r) =>
+    na(r) ? "" : not r.ok ? "no flow" : r.fb and r.absorbed ? "FB+ABS" : r.fb ? "FB" : r.absorbed ? "ABS" : "flow -"
+
+flowTip(FlowRead r) =>
+    na(r) ? "" : not r.ok ? "Footprint: no data on the sweep bar (plan, symbol or history depth)." : "Footprint on the sweep bar: " + str.tostring(r.penTicks, "#.#") + " ticks through, " + str.tostring(r.beyond * 100, "#") + "% of volume beyond, heaviest row at the level " + (na(r.heavyX) ? "n/a" : str.tostring(r.heavyX, "#.#") + "x median") + ", " + (na(r.into) ? "n/a" : str.tostring(r.into * 100, "#") + "%") + " aggression into the level, delta " + str.tostring(r.delta, "#") + ". FB = failed break, ABS = absorbed."
+
+// Sweep readings of this bar, lifted out of the level loop for the Data Window. When several levels of one side are taken on
+// the same bar, the one nearest the bar's extreme (the last pool taken) is kept.
+type SweepSlot
+    float lvl = na
+    FlowRead rd = na
+var SweepSlot slotHi = SweepSlot.new()
+var SweepSlot slotLo = SweepSlot.new()
+slotHi.lvl := na
+slotHi.rd := na
+slotLo.lvl := na
+slotLo.rd := na
+
 // A liquidity level with its lifecycle. side = 1 high, -1 low.
 type Level
     float price
@@ -155,6 +288,7 @@ type Level
     float sweepExt = na       // v1.4: the extreme reached since the sweep, the far edge of the block it may become
     int   sweepExtBar = na
     bool  lbDone = false      // v1.4: the block question is settled (born, or it ran without closing back)
+    FlowRead flow = na        // v1.5: the footprint at this level on the bar that pierced it
 
 var array<Level> highs = array.new<Level>()
 var array<Level> lows  = array.new<Level>()
@@ -186,6 +320,27 @@ float htfPH = request.security(syminfo.tickerid, htfTf, ta.pivothigh(high, htfPi
 float htfPL = request.security(syminfo.tickerid, htfTf, ta.pivotlow(low, htfPiv, htfPiv), barmerge.gaps_off, barmerge.lookahead_off)
 var float htfRefHigh = na   // nearest unrun HTF pivot high (updated as they form, retired when run)
 var float htfRefLow  = na
+// unswept 3-bar swing highs / lows on the chart timeframe, the levels his targets sit on most often (v1.7.2)
+float sw3H = ta.pivothigh(high, 3, 3)
+float sw3L = ta.pivotlow(low, 3, 3)
+var array<float> ieSwH = array.new<float>()
+var array<float> ieSwL = array.new<float>()
+if not na(sw3H)
+    array.push(ieSwH, sw3H)
+if not na(sw3L)
+    array.push(ieSwL, sw3L)
+if array.size(ieSwH) > 0
+    for i = array.size(ieSwH) - 1 to 0
+        if high > array.get(ieSwH, i)
+            array.remove(ieSwH, i)
+if array.size(ieSwL) > 0
+    for i = array.size(ieSwL) - 1 to 0
+        if low < array.get(ieSwL, i)
+            array.remove(ieSwL, i)
+if array.size(ieSwH) > 60
+    array.shift(ieSwH)
+if array.size(ieSwL) > 60
+    array.shift(ieSwL)
 if not na(htfPH)
     htfRefHigh := htfPH
 if not na(htfPL)
@@ -254,12 +409,16 @@ nearestEqBelow(float p) =>
 // ------------------------------------------------------------------ level styling
 styleLevel(Level L, bool dup) =>
     color c = L.swept ? cLb : L.engineered ? cEng : L.touches >= 2 ? cEq : cLiq
-    string txt = L.swept ? "swept: " + (L.sweepKind == "GRAB" ? "grab" : L.sweepKind == "SWP" ? "sweep" : L.sweepKind == "RUN" ? "run" : "run?") : L.engineered ? "ENG LQ " + (L.side == 1 ? "high " : "low ") + str.tostring(L.price, format.mintick) + " x" + str.tostring(L.touches) + " -> " + str.tostring(L.refPrice, format.mintick) : L.touches >= 2 ? (L.side == 1 ? "EQH x" : "EQL x") + str.tostring(L.touches) : "LIQ"
-    bool hidden = focusMode and ((not L.respected and not L.swept) or L.swept)
+    string plain = ieDollar ? (L.touches >= 2 ? "$$$ x" + str.tostring(L.touches) : L.respected ? "$$$" : L.structural ? "$" : "") : L.touches >= 2 ? (L.side == 1 ? "EQH x" : "EQL x") + str.tostring(L.touches) : "LIQ"
+    string txt = L.swept ? "swept: " + (L.sweepKind == "GRAB" ? "grab" : L.sweepKind == "SWP" ? "sweep" : L.sweepKind == "RUN" ? "run" : "run?") : L.engineered ? "ENG LQ " + (L.side == 1 ? "high " : "low ") + str.tostring(L.price, format.mintick) + " x" + str.tostring(L.touches) + " -> " + str.tostring(L.refPrice, format.mintick) : plain
+    // v1.6: with his labels on, an intact higher low / lower high stays visible in focus mode as a $ breadcrumb (03:24-04:44)
+    bool intactStruct = ieDollar and L.structural
+    bool hidden = focusMode and (L.swept or (not L.respected and not intactStruct))
     line.set_color(L.ln, hidden ? color.new(c, 100) : c)
     line.set_style(L.ln, L.swept ? line.style_dotted : L.respected ? line.style_solid : line.style_dashed)
     line.set_width(L.ln, L.engineered and not L.swept ? 3 : 1)
-    label.set_text(L.lb, hidden or dup ? "" : txt)
+    label.set_text(L.lb, hidden or dup ? "" : txt + (L.swept and not na(L.flow) ? " " + flowTag(L.flow) : ""))
+    label.set_tooltip(L.lb, L.swept ? flowTip(L.flow) : "")
     label.set_textcolor(L.lb, c)
     label.set_size(L.lb, L.engineered and not L.swept ? size.small : size.tiny)
 
@@ -455,6 +614,7 @@ type LBlock
     int   endBar = na   // bar the block ended or failed: the drawing freezes here
     box   bx = na
     label lb = na
+    FlowRead flow = na  // v1.5: the footprint reading of the sweep that spawned it (display and export only)
 var array<LBlock> lbUp = array.new<LBlock>()   // side = 1, sell anchors
 var array<LBlock> lbDn = array.new<LBlock>()   // side = -1, buy anchors
 
@@ -491,6 +651,9 @@ styleLB(LBlock B) =>
         bgT := B.state == 4 ? 95 : 93
         txt := B.state == 2 ? "LB inv" : B.state == 3 ? "LB lowp" : "LB x"
         tip := (B.state == 2 ? "LB invalid: " : B.state == 3 ? "LB low probability: " : "LB ended: ") + B.why
+    if not na(B.flow)
+        txt := txt + " " + flowTag(B.flow)
+        tip := tip + " " + flowTip(B.flow)
     int rightBar = live or na(B.endBar) ? bar_index + 2 : B.endBar + 2
     box.set_border_color(B.bx, color.new(c, bdT))
     box.set_border_style(B.bx, B.state == 0 ? line.style_dashed : line.style_solid)
@@ -645,6 +808,8 @@ spawnLB(Level L, int side) =>
                 B.anchor := side == 1 ? math.min(B.anchor, L.price) : math.max(B.anchor, L.price)
                 box.set_top(B.bx, math.max(B.anchor, B.far))
                 box.set_bottom(B.bx, math.min(B.anchor, B.far))
+                if na(B.flow)
+                    B.flow := L.flow
                 merged := true
                 break
     if not merged
@@ -655,7 +820,9 @@ spawnLB(Level L, int side) =>
         bool okTgt = not lbNeedTarget or not na(tgt)
         bool promoted = promoteLB(arr, L.price, far, side)
         if not promoted and (okTgt or lbShowInvalid)
-            array.push(arr, newLB(L.price, far, side, L.sweptBar, tgt, ttyp, bos, L.sweepExtBar, okTgt ? 0 : 2, okTgt ? "" : "no pool to target (28:45)"))
+            LBlock nb = newLB(L.price, far, side, L.sweptBar, tgt, ttyp, bos, L.sweepExtBar, okTgt ? 0 : 2, okTgt ? "" : "no pool to target (28:45)")
+            nb.flow := L.flow
+            array.push(arr, nb)
 
 // v1.3.2: true when another swept level of the same side sits inside the merge distance and was swept later
 // (same bar: the later array slot wins), so only one label of a cluster keeps its text.
@@ -731,11 +898,18 @@ processSide(Level[] arr, int side) =>
                     L.sweepKind := kind
                     L.sweepExt := side == 1 ? high : low
                     L.sweepExtBar := bar_index
+                    // v1.5: the footprint at this level on the piercing bar
+                    if fpOn
+                        L.flow := readLevel(L.price, side)
+                        SweepSlot sl = side == 1 ? slotHi : slotLo
+                        if na(sl.lvl) or (side == 1 ? L.price > sl.lvl : L.price < sl.lvl)
+                            sl.lvl := L.price
+                            sl.rd := L.flow
                     if not focusMode
                         L.bx := box.new(bar_index, side == 1 ? high : L.price, bar_index + 3, side == 1 ? L.price : low, border_color = color.new(cLb, 40), bgcolor = color.new(cLb, 85))
                     if not focusMode
                         label.new(bar_index, side == 1 ? high : low, kind, style = side == 1 ? label.style_label_down : label.style_label_up, color = color.new(cLb, 20), textcolor = color.white, size = size.tiny)
-                    alert("MWM LiqMap: " + kind + " of " + (side == 1 ? "high " : "low ") + str.tostring(L.price, format.mintick) + (L.engineered ? " (was ENG-" + L.refType + ")" : ""), alert.freq_once_per_bar_close)
+                    alert("MWM LiqMap: " + kind + " of " + (side == 1 ? "high " : "low ") + str.tostring(L.price, format.mintick) + (L.engineered ? " (was ENG-" + L.refType + ")" : "") + (na(L.flow) ? "" : ", footprint " + flowTag(L.flow)), alert.freq_once_per_bar_close)
                     // [IE] v1.4: only a spike that closes back becomes a liquidity block ("price spiked it out and moved away",
                     // x-7H1E4ToC8). A GRAB qualifies on this bar; a close beyond waits below for a close back inside.
                     if showLB and closedBack
@@ -831,6 +1005,390 @@ capLB(lbUp, 0)
 capLB(lbDn, 1)
 capLB(lbDn, 0)
 
+// ------------------------------------------------------------------ v1.6 InterEquity induce -> trap cycle [IE SkKjZeY6EN4]
+// A TRAP box sits on a pool after traders on the OTHER side were induced. side = -1: the pool is a low (bottom edge, his $$$
+// line) and buyers were induced, so bounces inside it are false. side = 1: mirrored at a high.
+type IETrap
+    float bot
+    float top
+    int   side
+    int   bar
+    int   reactions = 0
+    int   touchBar = na
+    bool  done = false
+    int   endBar = na
+    box   bx
+
+// One inducement and what followed it. dir = -1: a close below the last pivot low induced sellers; the high the leg came from
+// (origin) is where they get trapped. dir = 1 mirrored.
+type IECycle
+    int   dir
+    float bos
+    int   bosBar
+    float origin
+    int   originBar
+    float legExt        // the induced leg's extreme, the pool the trapped zone trades toward
+    int   state = 0     // 0 induced, 1 trapped, 2 ended
+    int   endBar = na
+    float zoneFar = na
+    bool  zoneFixed = false
+    int   trapBar = na
+    string why = ""
+    line  bosLn
+    label bosLb
+    line  trapLn = na
+    label trapLb = na
+    box   zone = na
+
+var array<IECycle> ieBear = array.new<IECycle>()   // dir -1, sellers induced
+var array<IECycle> ieBull = array.new<IECycle>()   // dir 1, buyers induced
+var array<IETrap> ieTrapLo = array.new<IETrap>()   // pools at lows
+var array<IETrap> ieTrapHi = array.new<IETrap>()   // pools at highs
+var int ieBearPiv = na
+var int ieBullPiv = na
+
+// The extreme of the bars from fromBar to now: side 1 = highest high, -1 = lowest low. Returns [price, bar].
+ieExt(int fromBar, int side) =>
+    int n = math.min(bar_index - fromBar, 1990)
+    float p = na
+    int b = na
+    if n >= 0
+        for o = 0 to n
+            float v = side == 1 ? high[o] : low[o]
+            if na(p) or (side == 1 ? v > p : v < p)
+                p := v
+                b := bar_index - o
+    [p, b]
+
+ieTrapText(IETrap T) =>
+    (T.side == -1 ? "$$$ " : "") + "TRAP" + (T.reactions > 0 ? "  ENG LQ x" + str.tostring(T.reactions) : "") + (T.side == 1 ? " $$$" : "") + (T.done ? "  taken" : "")
+
+// A TRAP box on the pool at `pool`, spanning toward `toward` (the broken level) and capped at ieTrapAtr x ATR. An overlapping
+// live box on the same side widens instead of stacking a second one.
+ieAddTrap(int side, float pool, float toward, int leftBar) =>
+    IETrap[] arr = side == -1 ? ieTrapLo : ieTrapHi
+    float h = math.max(math.min(math.abs(toward - pool), ieTrapAtr * atr), band)
+    float bot = side == -1 ? pool : pool - h
+    float top = side == -1 ? pool + h : pool
+    bool merged = false
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            IETrap T = array.get(arr, i)
+            if not T.done and bot <= T.top and top >= T.bot
+                T.bot := math.min(T.bot, bot)
+                T.top := math.max(T.top, top)
+                box.set_top(T.bx, T.top)
+                box.set_bottom(T.bx, T.bot)
+                merged := true
+                break
+    if not merged
+        box bx = box.new(leftBar, top, bar_index + 2, bot, border_color = color.new(cTrap, 50), bgcolor = color.new(cTrap, 85), text = "", text_color = cTrap, text_size = size.small, text_halign = text.align_center, text_valign = side == -1 ? text.align_bottom : text.align_top)
+        IETrap nt = IETrap.new(bot, top, side, bar_index, bx = bx)
+        box.set_text(bx, ieTrapText(nt))
+        array.push(arr, nt)
+        // the oldest box of the side goes first once more than ieKeep are live
+        int live = 0
+        for k = 0 to array.size(arr) - 1
+            IETrap Y = array.get(arr, k)
+            if not Y.done
+                live += 1
+        if live > ieKeep
+            for k = 0 to array.size(arr) - 1
+                IETrap X = array.get(arr, k)
+                if not X.done
+                    box.delete(X.bx)
+                    array.remove(arr, k)
+                    break
+
+ieNewCycle(int dir, float lvl, int pivBar0) =>
+    IECycle[] arr = dir == -1 ? ieBear : ieBull
+    [o, ob] = ieExt(pivBar0, -dir)
+    string nm = dir == -1 ? "IND sellers" : "IND buyers"
+    line ln = line.new(pivBar0, lvl, bar_index, lvl, color = color.new(color.gray, 20), width = 1)
+    label lb = label.new(math.round((pivBar0 + bar_index) / 2), lvl, nm, style = dir == -1 ? label.style_label_up : label.style_label_down, color = color.new(color.white, 100), textcolor = color.gray, size = size.tiny)
+    IECycle c = IECycle.new(dir, lvl, bar_index, o, ob, dir == -1 ? low : high, bosLn = ln, bosLb = lb)
+    array.push(arr, c)
+    if array.size(arr) > ieKeep
+        IECycle old = array.shift(arr)
+        line.delete(old.bosLn)
+        label.delete(old.bosLb)
+        line.delete(old.trapLn)
+        label.delete(old.trapLb)
+        box.delete(old.zone)
+    // traders on this side are induced, so the pool the leg came from is a TRAP for the other side (16:20)
+    ieAddTrap(dir == -1 ? 1 : -1, o, lvl, ob)
+    alert("MWM LiqMap: " + nm + " at " + str.tostring(lvl, format.mintick) + ", TRAP on the " + (dir == -1 ? "high " : "low ") + str.tostring(o, format.mintick), alert.freq_once_per_bar_close)
+
+// v1.6.1: the trade a trapped zone offers, drawn so the setup reads as an order. side = -1 short, 1 long.
+type IETrade
+    int   side
+    int   bar
+    float entry
+    float stop
+    float target
+    float r
+    int   outcome = 0     // 0 open, 1 target hit, -1 stopped
+    bool  blockOpen = false  // entered at the trapped level; stop is final once the spike ends
+    int   endBar = na
+    line  eLn
+    line  sLn
+    line  tLn
+    label lb
+
+var array<IETrade> ieTrades = array.new<IETrade>()
+// running tally; a UDT because a function may change an object's fields but not a global variable
+type IETally
+    int   n = 0
+    int   win = 0
+    int   loss = 0
+    float sumR = 0.0
+    int   lastBar = na   // bar of the latest entry, read by the plotshape arrows below
+    int   lastSide = 0
+var IETally ieTally = IETally.new()
+
+ieTradeText(IETrade t) =>
+    string head = (t.side == -1 ? "SELL " : "BUY ") + str.tostring(t.entry, format.mintick)
+    string body = "  SL " + str.tostring(t.stop, format.mintick) + "  TP " + str.tostring(t.target, format.mintick) + "  " + str.tostring(t.r, "#.#") + "R"
+    head + body + (t.outcome == 1 ? "  -> TP +" + str.tostring(t.r, "#.#") + "R" : t.outcome == -1 ? "  -> SL -1R" : "")
+
+// nearest HTF pool beyond the induced leg's extreme, in the trade's direction; na when none
+ieHtfTarget(int side, float legExt) =>
+    float best = na
+    for p in array.from(htfRefLow, htfRefHigh, pdl, pdh)
+        if not na(p)
+            bool beyond = side == -1 ? p < legExt - breach : p > legExt + breach
+            if beyond and (na(best) or (side == -1 ? p > best : p < best))
+                best := p
+    best
+
+// nearest unswept 3-bar swing beyond the induced leg's extreme, in the trade's direction; na when none
+ieSwingTarget(int side, float legExt) =>
+    float best = na
+    float[] arr = side == -1 ? ieSwL : ieSwH
+    if array.size(arr) > 0
+        for p in arr
+            bool beyond = side == -1 ? p < legExt - breach : p > legExt + breach
+            if beyond and (na(best) or (side == -1 ? p > best : p < best))
+                best := p
+    best
+
+// stop beyond the nearest unswept 3-bar swing past the entry, never inside the trapping spike; na when no swing
+ieSwingStop(int side, float entry, float spikeStop) =>
+    float best = na
+    float[] arr = side == -1 ? ieSwH : ieSwL
+    if array.size(arr) > 0
+        for p in arr
+            bool beyond = side == -1 ? p > entry : p < entry
+            if beyond and (na(best) or (side == -1 ? p < best : p > best))
+                best := p
+    float out = na
+    if not na(best)
+        out := side == -1 ? math.max(best + ieSwStopAtr * atr, spikeStop) : math.min(best - ieSwStopAtr * atr, spikeStop)
+    out
+
+ieOpenTrade(IECycle c, float entryPx) =>
+    int side = c.dir == -1 ? -1 : 1      // sellers were trapped, so the trade is a short
+    float buf = ieStopBuf * atr
+    float entry = entryPx
+    float spikeStop = side == -1 ? c.zoneFar + buf : c.zoneFar - buf
+    float swStop = ieStopMode == "3-bar swing + ATR (his)" ? ieSwingStop(side, entryPx, spikeStop) : na
+    float stop = na(swStop) ? spikeStop : swStop
+    float swT = ieTgtMode == "3-bar swing beyond the leg (his)" ? ieSwingTarget(side, c.legExt) : na
+    float htfT = ieTgtMode != "Induced leg extreme (v1.6)" and na(swT) ? ieHtfTarget(side, c.legExt) : na
+    float target = not na(swT) ? swT : not na(htfT) ? htfT : c.legExt
+    float risk = math.abs(stop - entry)
+    float reward = side == -1 ? entry - target : target - entry
+    float r = risk > 0 and reward > 0 ? reward / risk : na
+    // two cycles trapped by the same spike would print the same trade twice; one per bar and side
+    bool dup = ieTally.lastBar == bar_index and ieTally.lastSide == side
+    if not na(r) and r >= ieMinR and not dup
+        color ec = color.white
+        line eLn = line.new(bar_index, entry, bar_index + 5, entry, color = color.new(ec, 0), width = 2)
+        line sLn = line.new(bar_index, stop, bar_index + 5, stop, color = color.new(color.red, 0), width = 2)
+        line tLn = line.new(bar_index, target, bar_index + 5, target, color = color.new(color.lime, 0), width = 2)
+        label lb = ieTradeLbl ? label.new(bar_index, stop, "", style = side == -1 ? label.style_label_down : label.style_label_up, color = side == -1 ? color.new(color.red, 10) : color.new(color.teal, 10), textcolor = color.white, size = size.small) : na
+        IETrade t = IETrade.new(side, bar_index, entry, stop, target, r, eLn = eLn, sLn = sLn, tLn = tLn, lb = lb, blockOpen = ieEntryMode == "At the trapped level (his)")
+        if not na(lb)
+            label.set_text(lb, ieTradeText(t))
+            label.set_tooltip(lb, "Entry = close back inside the trapped " + (side == -1 ? "high " : "low ") + str.tostring(c.origin, format.mintick) + ". Stop beyond the spike " + str.tostring(c.zoneFar, format.mintick) + " plus buffer. Target = the induced leg's extreme (the TRAP $$$). Display only: same-bar stop and target count as a stop. Not a backtest.")
+        array.push(ieTrades, t)
+        ieTally.n += 1
+        ieTally.lastBar := bar_index
+        ieTally.lastSide := side
+        alert("MWM LiqMap: " + (side == -1 ? "SELL " : "BUY ") + str.tostring(entry, format.mintick) + " SL " + str.tostring(stop, format.mintick) + " TP " + str.tostring(target, format.mintick) + " (" + str.tostring(r, "#.#") + "R), " + (side == -1 ? "sellers" : "buyers") + " trapped at " + str.tostring(c.origin, format.mintick), alert.freq_once_per_bar_close)
+
+// The spike that trapped them has ended: move the trade's stop beyond its final extreme ("covering that liquidity block").
+ieCloseBlock(IECycle c) =>
+    int side = c.dir == -1 ? -1 : 1
+    if array.size(ieTrades) > 0
+        for i = array.size(ieTrades) - 1 to 0
+            IETrade t = array.get(ieTrades, i)
+            if t.blockOpen and t.side == side and t.bar == c.trapBar
+                float buf = ieStopBuf * atr
+                float spikeStop = side == -1 ? c.zoneFar + buf : c.zoneFar - buf
+                // the stop covers the whole spike; a wider swing stop set at entry stays
+                t.stop := side == -1 ? math.max(t.stop, spikeStop) : math.min(t.stop, spikeStop)
+                float risk = math.abs(t.stop - t.entry)
+                float reward = side == -1 ? t.entry - t.target : t.target - t.entry
+                t.r := risk > 0 and reward > 0 ? reward / risk : t.r
+                t.blockOpen := false
+                line.set_y1(t.sLn, t.stop)
+                line.set_y2(t.sLn, t.stop)
+                if not na(t.lb)
+                    label.set_text(t.lb, ieTradeText(t))
+
+// Open trades extend; the stop is checked before the target, so a bar touching both counts as a loss.
+ieStepTrades() =>
+    if array.size(ieTrades) > 0
+        for i = array.size(ieTrades) - 1 to 0
+            IETrade t = array.get(ieTrades, i)
+            if t.outcome == 0 and bar_index > t.bar and not t.blockOpen
+                bool stopped = t.side == -1 ? high >= t.stop : low <= t.stop
+                bool won = t.side == -1 ? low <= t.target : high >= t.target
+                if stopped or won
+                    t.outcome := stopped ? -1 : 1
+                    t.endBar := bar_index
+                    if stopped
+                        ieTally.loss += 1
+                        ieTally.sumR -= 1.0
+                    else
+                        ieTally.win += 1
+                        ieTally.sumR += t.r
+                    if not na(t.lb)
+                        label.set_text(t.lb, ieTradeText(t))
+                        label.set_color(t.lb, t.outcome == 1 ? color.new(color.green, 20) : color.new(color.gray, 20))
+            if t.outcome == 0
+                line.set_x2(t.eLn, bar_index + 5)
+                line.set_x2(t.sLn, bar_index + 5)
+                line.set_x2(t.tLn, bar_index + 5)
+        // finished trades beyond the keep count are removed, oldest first
+        int done = 0
+        for i = array.size(ieTrades) - 1 to 0
+            IETrade t = array.get(ieTrades, i)
+            if t.outcome != 0
+                done += 1
+                if done > ieTradeKeep
+                    line.delete(t.eLn)
+                    line.delete(t.sLn)
+                    line.delete(t.tLn)
+                    label.delete(t.lb)
+                    array.remove(ieTrades, i)
+
+ieStepCycles(IECycle[] arr) =>
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            IECycle c = array.get(arr, i)
+            bool up = c.dir == -1          // sellers induced: the trap happens above
+            if c.state == 0
+                c.legExt := up ? math.min(c.legExt, low) : math.max(c.legExt, high)
+                bool took = up ? high > c.origin + breach : low < c.origin - breach
+                if took
+                    c.state := 1
+                    string nm = up ? "Sellers trapped" : "Buyers trapped"
+                    c.trapLn := line.new(c.originBar, c.origin, bar_index, c.origin, color = color.new(color.gray, 20), width = 1)
+                    c.trapLb := label.new(bar_index, c.origin, nm, style = up ? label.style_label_down : label.style_label_up, color = color.new(color.white, 100), textcolor = color.gray, size = size.tiny)
+                    c.zoneFar := up ? high : low
+                    c.trapBar := bar_index
+                    if ieZone
+                        c.zone := box.new(bar_index, math.max(c.origin, c.zoneFar), bar_index + 2, math.min(c.origin, c.zoneFar), border_color = color.new(cLbLive, 40), bgcolor = color.new(cLbLive, 85), text = up ? "SELL zone" : "BUY zone", text_color = cLbLive, text_size = size.tiny, text_halign = text.align_right)
+                    // the spike that trapped them took highs (lows), so the induced leg's extreme is now a TRAP (07:15)
+                    ieAddTrap(up ? -1 : 1, c.legExt, c.bos, bar_index)
+                    if ieEntries and ieEntryMode == "At the trapped level (his)"
+                        ieOpenTrade(c, c.origin)
+                    alert("MWM LiqMap: " + nm + " above " + str.tostring(c.origin, format.mintick) + ", zone toward " + str.tostring(c.legExt, format.mintick), alert.freq_once_per_bar_close)
+            else if c.state == 1
+                bool justFixed = false
+                if not c.zoneFixed
+                    if up ? high > c.zoneFar : low < c.zoneFar
+                        c.zoneFar := up ? high : low
+                    if up ? close < c.origin : close > c.origin
+                        c.zoneFixed := true
+                        justFixed := true
+                bool through = c.zoneFixed and (up ? close > c.zoneFar + breach : close < c.zoneFar - breach)
+                bool hit = up ? low < c.legExt - breach : high > c.legExt + breach
+                if through or hit
+                    c.state := 2
+                    c.endBar := bar_index
+                    c.why := hit ? "target taken" : "closed through"
+                    if not c.zoneFixed and ieEntryMode == "At the trapped level (his)"
+                        ieCloseBlock(c)  // leg target hit before the spike closed back: settle the stop where it is
+                if justFixed and ieEntryMode == "At the trapped level (his)"
+                    ieCloseBlock(c)
+                if justFixed and c.state == 1 and ieEntries and ieEntryMode == "Close back inside (v1.6)"
+                    ieOpenTrade(c, close)
+                if not na(c.zone)
+                    box.set_top(c.zone, math.max(c.origin, c.zoneFar))
+                    box.set_bottom(c.zone, math.min(c.origin, c.zoneFar))
+                    box.set_right(c.zone, bar_index + 2)
+                    if c.state == 2
+                        box.set_text(c.zone, (up ? "SELL zone " : "BUY zone ") + c.why)
+                        box.set_bgcolor(c.zone, color.new(color.gray, 92))
+                        box.set_border_color(c.zone, color.new(color.gray, 60))
+                        box.set_text_color(c.zone, color.gray)
+
+ieStepTraps(IETrap[] arr) =>
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            IETrap T = array.get(arr, i)
+            if T.done
+                if bar_index - T.endBar > lbDeadKeep
+                    box.delete(T.bx)
+                    array.remove(arr, i)
+                continue
+            bool lo = T.side == -1
+            float pool = lo ? T.bot : T.top
+            if lo ? low < pool - breach : high > pool + breach
+                T.done := true
+                T.endBar := bar_index
+                box.set_bgcolor(T.bx, color.new(color.gray, 92))
+                box.set_border_color(T.bx, color.new(color.gray, 60))
+                box.set_text_color(T.bx, color.gray)
+                alert("MWM LiqMap: TRAP " + (lo ? "low " : "high ") + str.tostring(pool, format.mintick) + " taken after " + str.tostring(T.reactions) + " engineered reactions", alert.freq_once_per_bar_close)
+            else
+                bool inBox = lo ? low <= T.top : high >= T.bot
+                if inBox and na(T.touchBar) and bar_index > T.bar
+                    T.touchBar := bar_index
+                bool away = lo ? close > T.top : close < T.bot
+                if not na(T.touchBar) and bar_index - T.touchBar >= ieReact and away
+                    T.reactions += 1
+                    T.touchBar := na
+                    alert("MWM LiqMap: engineered liquidity x" + str.tostring(T.reactions) + " off the TRAP " + (lo ? "low " : "high ") + str.tostring(pool, format.mintick), alert.freq_once_per_bar_close)
+                box.set_right(T.bx, bar_index + 2)
+            box.set_text(T.bx, ieTrapText(T))
+
+if ieOn
+    if not na(lastPL) and close < lastPL and close[1] >= lastPL and (na(ieBearPiv) or lastPLBar != ieBearPiv)
+        ieBearPiv := lastPLBar
+        ieNewCycle(-1, lastPL, lastPLBar)
+    if not na(lastPH) and close > lastPH and close[1] <= lastPH and (na(ieBullPiv) or lastPHBar != ieBullPiv)
+        ieBullPiv := lastPHBar
+        ieNewCycle(1, lastPH, lastPHBar)
+    ieStepCycles(ieBear)
+    ieStepCycles(ieBull)
+    ieStepTraps(ieTrapLo)
+    ieStepTraps(ieTrapHi)
+    ieStepTrades()
+
+// The latest live TRAP of a side, for the status table: [pool, reactions], na when none.
+ieLatestTrap(IETrap[] arr) =>
+    float p = na
+    int r = 0
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            IETrap T = array.get(arr, i)
+            if not T.done
+                p := T.side == -1 ? T.bot : T.top
+                r := T.reactions
+                break
+    [p, r]
+
+// Entry arrows as plots: they are never removed by the drawing limits, show in the Data Window and in "Export chart data".
+bool ieSellNow = ieOn and ieEntries and ieTally.lastBar == bar_index and ieTally.lastSide == -1
+bool ieBuyNow  = ieOn and ieEntries and ieTally.lastBar == bar_index and ieTally.lastSide == 1
+plotshape(ieSellNow, "SELL entry", shape.triangledown, location.abovebar, color.red, size = size.normal, text = "SELL", textcolor = color.red)
+plotshape(ieBuyNow, "BUY entry", shape.triangleup, location.belowbar, color.lime, size = size.normal, text = "BUY", textcolor = color.lime)
+bgcolor(ieSellNow ? color.new(color.red, 80) : ieBuyNow ? color.new(color.lime, 80) : na, title = "Entry bar")
+
 // ------------------------------------------------------------------ inducement boxes [MA][PH]
 // After a close above the last confirmed pivot high (buyers induced), shade the pullback that follows.
 var box indBoxUp = na
@@ -891,6 +1449,27 @@ plot(showPD and not focusMode ? pdc : na, "PDC", color = color.new(cPd, 50), sty
 plot(showPW and not focusMode ? pwh : na, "PWH", color = color.new(cPd, 30), style = plot.style_linebr, linewidth = 2)
 plot(showPW and not focusMode ? pwl : na, "PWL", color = color.new(cPd, 30), style = plot.style_linebr, linewidth = 2)
 
+// ------------------------------------------------------------------ v1.5 Data Window export: footprint at the swept level
+// Values print only on sweep bars. Code: 1 no flow data, 2 flow but neither flag, 3 FB, 4 ABS, 5 both.
+flowCode(SweepSlot s) =>
+    na(s.rd) ? float(na) : not s.rd.ok ? 1.0 : s.rd.fb and s.rd.absorbed ? 5.0 : s.rd.fb ? 3.0 : s.rd.absorbed ? 4.0 : 2.0
+fOk(SweepSlot s) =>
+    not na(s.rd) and s.rd.ok
+plot(flowCode(slotHi), "FP high swept: code", display = display.data_window)
+plot(slotHi.lvl, "FP high swept: level", display = display.data_window)
+plot(fOk(slotHi) ? slotHi.rd.penTicks : na, "FP high swept: ticks through", display = display.data_window)
+plot(fOk(slotHi) ? slotHi.rd.beyond : na, "FP high swept: share beyond", display = display.data_window)
+plot(fOk(slotHi) ? slotHi.rd.heavyX : na, "FP high swept: heavy row x", display = display.data_window)
+plot(fOk(slotHi) ? slotHi.rd.into : na, "FP high swept: share into", display = display.data_window)
+plot(fOk(slotHi) ? slotHi.rd.delta : na, "FP high swept: bar delta", display = display.data_window)
+plot(flowCode(slotLo), "FP low swept: code", display = display.data_window)
+plot(slotLo.lvl, "FP low swept: level", display = display.data_window)
+plot(fOk(slotLo) ? slotLo.rd.penTicks : na, "FP low swept: ticks through", display = display.data_window)
+plot(fOk(slotLo) ? slotLo.rd.beyond : na, "FP low swept: share beyond", display = display.data_window)
+plot(fOk(slotLo) ? slotLo.rd.heavyX : na, "FP low swept: heavy row x", display = display.data_window)
+plot(fOk(slotLo) ? slotLo.rd.into : na, "FP low swept: share into", display = display.data_window)
+plot(fOk(slotLo) ? slotLo.rd.delta : na, "FP low swept: bar delta", display = display.data_window)
+
 // ------------------------------------------------------------------ data candle wicks (08:30 and 10:00 New York) [WS][RT]
 isData830 = showData and not focusMode and hour(time, "America/New_York") == 8 and minute(time, "America/New_York") == 30
 isData1000 = showData and not focusMode and hour(time, "America/New_York") == 10 and minute(time, "America/New_York") == 0
@@ -902,7 +1481,7 @@ if isData830 or isData1000
     label.new(bar_index + 120, low, tag + " L", style = label.style_label_left, color = color.new(cData, 40), textcolor = color.white, size = size.tiny)
 
 // ------------------------------------------------------------------ status table
-var table info = table.new(position.top_right, 1, 8, bgcolor = color.new(color.black, 60))
+var table info = table.new(position.top_right, 1, 11, bgcolor = color.new(color.black, 60))
 countLB(LBlock[] arr, int st) =>
     int n = 0
     if array.size(arr) > 0
@@ -928,7 +1507,7 @@ countLive(Level[] arr) =>
                 n += 1
     n
 if barstate.islast
-    table.cell(info, 0, 0, "MWM Liquidity Map v1.4" + (focusMode ? " (focus)" : ""), text_color = color.white, text_size = size.small)
+    table.cell(info, 0, 0, "MWM Liquidity Map v1.6.1" + (focusMode ? " (focus)" : ""), text_color = color.white, text_size = size.small)
     table.cell(info, 0, 6, "LB armed sell/buy: " + str.tostring(countLB(lbUp, 1)) + " / " + str.tostring(countLB(lbDn, 1)) + "   pending: " + str.tostring(countLB(lbUp, 0)) + " / " + str.tostring(countLB(lbDn, 0)), text_color = cLbLive, text_size = size.tiny)
     table.cell(info, 0, 7, insideDayFlag ? "prior day ran both sides: inside day expected" : "inside-day flag: off", text_color = insideDayFlag ? color.orange : color.gray, text_size = size.tiny)
     table.cell(info, 0, 1, "live LIQ above/below: " + str.tostring(countLive(highs)) + " / " + str.tostring(countLive(lows)), text_color = cLiq, text_size = size.tiny)
@@ -936,3 +1515,10 @@ if barstate.islast
     table.cell(info, 0, 3, "HTF ref H/L: " + (na(htfRefHigh) ? "none" : str.tostring(htfRefHigh, format.mintick)) + " / " + (na(htfRefLow) ? "none" : str.tostring(htfRefLow, format.mintick)), text_color = color.white, text_size = size.tiny)
     table.cell(info, 0, 4, "band " + str.tostring(band, format.mintick) + "  breach " + str.tostring(breach, format.mintick), text_color = color.gray, text_size = size.tiny)
     table.cell(info, 0, 5, "no tolerance is sourced: sweep every input", text_color = color.gray, text_size = size.tiny)
+    if ieOn
+        [tlo, rlo] = ieLatestTrap(ieTrapLo)
+        [thi, rhi] = ieLatestTrap(ieTrapHi)
+        table.cell(info, 0, 8, "TRAP low " + (na(tlo) ? "none" : str.tostring(tlo, format.mintick) + " ENG x" + str.tostring(rlo) + ": no longs while it stands") , text_color = cTrap, text_size = size.tiny)
+        table.cell(info, 0, 9, "TRAP high " + (na(thi) ? "none" : str.tostring(thi, format.mintick) + " ENG x" + str.tostring(rhi) + ": no shorts while it stands"), text_color = cTrap, text_size = size.tiny)
+        if ieEntries
+            table.cell(info, 0, 10, "trades on this chart: " + str.tostring(ieTally.n) + "  TP " + str.tostring(ieTally.win) + " / SL " + str.tostring(ieTally.loss) + "  net " + str.tostring(ieTally.sumR, "#.#") + "R (chart replay, not a backtest)", text_color = color.white, text_size = size.tiny)
