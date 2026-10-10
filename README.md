@@ -18,6 +18,19 @@ The indicators in this repository are free and open source. I also offer more ad
 - TradingView profile: [tradingview.com/u/MatsWilliam](https://www.tradingview.com/u/MatsWilliam/)
 - Subscriptions: [whop.com/mwm-indicators](https://whop.com/mwm-indicators/)
 
+### MWM Scalp (v1.8, invite-only)
+
+BUY and SELL signals for scalping Micro Nasdaq-100 (MNQ) and Micro Gold (MGC) futures, with a stop and
+target drawn for each signal and a small status panel. A preset in the settings tunes it for each market.
+
+| Preset | Win rate | Profit factor | Trades per day | Timeframe | Signal hours (Central European time) |
+|---|---|---|---|---|---|
+| MNQ | 67% | 2.84 | 2.4 | 30 seconds | 07:00-20:00 |
+| MGC | 78% | 4.87 | 1.4 | 1 minute | 02:00-10:00 |
+
+Backtested results, not live trading. Past results do not guarantee future results. Needs a TradingView
+Premium or Ultimate plan and real-time CME data.
+
 ## EMA x VWAP Engulfing
 
 Watches one fast EMA against a session VWAP, marks the bar where a confirmation candle
